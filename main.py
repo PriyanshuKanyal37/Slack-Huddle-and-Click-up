@@ -44,7 +44,7 @@ redis = Redis(
 
 app = FastAPI()
 
-POLL_INTERVAL_SECONDS   = 60   # poll every minute as backup
+POLL_INTERVAL_SECONDS   = 120   # poll every 2 minute as backup
 in_progress: set        = set()  # bots currently being processed
 failed_bots: set        = set()  # bots that failed — skip until server restarts
 active_huddles: set     = set()  # channel IDs where a Recall bot was already sent
