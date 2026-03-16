@@ -258,10 +258,22 @@ async def run_pipeline(bot_id: str):
         except Exception as e:
             print(f"[Pipeline] Could not fetch participants: {e}")
 
+        # Calculate duration in minutes
+        duration_minutes = 0
+        try:
+            if recordings:
+                rec0 = recordings[0]
+                t_start = datetime.fromisoformat(rec0.get("started_at", "").replace("Z", "+00:00"))
+                t_end   = datetime.fromisoformat(rec0.get("completed_at", "").replace("Z", "+00:00"))
+                duration_minutes = int((t_end - t_start).total_seconds() / 60)
+        except Exception:
+            pass
+
         metadata = {
             "participants": participants,
             "started_at": details.get("join_at", ""),
             "ended_at": ended_at,
+            "duration_minutes": duration_minutes,
             "slack_channel": details.get("meeting_url", "")
         }
 
@@ -289,9 +301,9 @@ async def run_pipeline(bot_id: str):
             if os.path.exists(tmp_media_path):
                 os.unlink(tmp_media_path)
 
-        # Step 3 — Structure notes with GPT-4o Mini
-        print("[Step 3] Structuring notes with GPT-4o Mini...")
-        notes = await structure_notes(transcript, metadata["participants"])
+        # Step 3 — Structure notes with GPT-4o
+        print("[Step 3] Structuring notes with GPT-4o...")
+        notes = await structure_notes(transcript, metadata["participants"], metadata["duration_minutes"])
         print(f"[Step 3] Title: {notes.get('meeting_title')}")
 
         # Step 4 — Check if worth logging, then create ClickUp tasks
