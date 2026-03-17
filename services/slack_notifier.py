@@ -136,7 +136,14 @@ async def send_meeting_dms(notes: dict, metadata: dict):
     await _load_slack_users()
 
     blocks       = _build_dm_blocks(notes, metadata)
-    fallback_text = f"Meeting Notes: {notes.get('meeting_title', 'Huddle Meeting')}"
+    started = metadata.get("started_at", "")
+    try:
+        dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+        dt_ist = dt + timedelta(hours=5, minutes=30)
+        dt_str = dt_ist.strftime("%d %b, %I:%M %p")
+    except Exception:
+        dt_str = datetime.now().strftime("%d %b, %I:%M %p")
+    fallback_text = f"Meeting Notes | {dt_str} IST"
 
     for name in participant_names:
         slack_user_id = _match_slack_user(name)
