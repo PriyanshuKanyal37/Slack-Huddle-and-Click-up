@@ -25,7 +25,7 @@ from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from dotenv import load_dotenv
 from upstash_redis.asyncio import Redis
 from services.transcriber import transcribe_audio
-from services.summarizer import structure_notes, extract_meeting_keywords, clean_transcript
+from services.summarizer import structure_notes, extract_meeting_keywords
 from services.clickup import create_meeting_task, search_relevant_tasks
 from services.slack_notifier import send_meeting_dms
 from services.slack_interact import handle_interaction
@@ -303,11 +303,7 @@ async def run_pipeline(bot_id: str):
             if os.path.exists(tmp_media_path):
                 os.unlink(tmp_media_path)
 
-        # Step 3 — Clean transcript (fix phonetic errors in tech/brand names)
-        print("[Step 3] Cleaning transcript...")
-        transcript = await clean_transcript(transcript)
-
-        # Step 4 — Extract keywords from transcript → search ClickUp workspace
+        # Step 3 — Extract keywords from transcript → search ClickUp workspace
         relevant_tasks = []
         try:
             keywords = await extract_meeting_keywords(transcript)
@@ -316,30 +312,30 @@ async def run_pipeline(bot_id: str):
         except Exception as e:
             print(f"[Step 3] Could not get relevant tasks: {e}")
 
-        # Step 5 — Structure notes with GPT
-        print("[Step 5] Structuring notes with GPT...")
+        # Step 4 — Structure notes with GPT
+        print("[Step 4] Structuring notes with GPT...")
         notes = await structure_notes(
             transcript,
             metadata["participants"],
             metadata["duration_minutes"],
             relevant_tasks or None
         )
-        print(f"[Step 5] Title: {notes.get('meeting_title')}")
+        print(f"[Step 4] Title: {notes.get('meeting_title')}")
 
-        # Step 6 — Check if worth logging, then create ClickUp task
+        # Step 5 — Check if worth logging, then create ClickUp task
         if not notes.get("worth_logging", True):
             reason = notes.get("skip_reason", "Not valuable enough")
-            print(f"[Step 6] Skipping ClickUp — {reason}")
+            print(f"[Step 5] Skipping ClickUp — {reason}")
         else:
-            print("[Step 6] Creating ClickUp task...")
+            print("[Step 5] Creating ClickUp task...")
             await create_meeting_task(notes, metadata)
 
-        # Step 7 — Send Slack DMs to each participant with action points
-        print("[Step 7] Sending Slack DMs...")
+        # Step 6 — Send Slack DMs to each participant with action points
+        print("[Step 6] Sending Slack DMs...")
         try:
             await send_meeting_dms(notes, metadata)
         except Exception as e:
-            print(f"[Step 7] Slack DM failed (non-fatal): {e}")
+            print(f"[Step 6] Slack DM failed (non-fatal): {e}")
 
         await mark_processed(bot_id)
         in_progress.discard(bot_id)
