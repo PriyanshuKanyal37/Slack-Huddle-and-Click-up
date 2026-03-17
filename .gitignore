@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+transcript_cache.txt
+SYSTEM_PLAN.md
+test_pipeline_on_longest.py
+test_dm.py
+test_meetings_last_3hrs.py

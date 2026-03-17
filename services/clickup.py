@@ -1,15 +1,19 @@
 import httpx
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
 
-CLICKUP_API_KEY  = os.getenv("CLICKUP_API_KEY")
-CLICKUP_LIST_ID  = os.getenv("CLICKUP_LIST_ID")
+CLICKUP_API_KEY       = os.getenv("CLICKUP_API_KEY")
+CLICKUP_LIST_ID       = os.getenv("CLICKUP_LIST_ID")        # Huddle Meetings list — where notes are posted
+CLICKUP_BACKLOG_LIST_ID = os.getenv("CLICKUP_BACKLOG_LIST_ID") # Backlog list — where work tasks live
+CLICKUP_TEAM_ID       = "9017847781"
 BASE_URL         = "https://api.clickup.com/api/v2"
 DATE_FIELD_ID    = "00a57e74-5b15-42da-8e6d-7163977c66ce"  # custom "Date" field
 MEMBERS_TTL_SECS = 3600  # re-fetch ClickUp members every 1 hour
+BACKLOG_TTL_SECS = 300   # re-fetch backlog tasks every 5 minutes
 
 HEADERS = {
     "Authorization": CLICKUP_API_KEY,
@@ -19,7 +23,12 @@ HEADERS = {
 # Cache of ClickUp members: {username_lower: (id, display_name)}
 # Refreshed every hour so new team members are picked up automatically
 _members_cache: dict = {}
+_members_by_id: dict = {}          # {clickup_user_id: {"name": ..., "email": ...}}
 _members_fetched_at: datetime | None = None
+
+# Cache of all Backlog tasks — refreshed every 5 minutes
+_backlog_cache: list = []
+_backlog_fetched_at: float = 0
 
 
 async def _load_members():
@@ -27,7 +36,7 @@ async def _load_members():
     Fetch list members from ClickUp API.
     Refreshes every hour — new members added to ClickUp are picked up automatically.
     """
-    global _members_cache, _members_fetched_at
+    global _members_cache, _members_by_id, _members_fetched_at
 
     now = datetime.now(timezone.utc)
     if _members_fetched_at and (now - _members_fetched_at).total_seconds() < MEMBERS_TTL_SECS:
@@ -41,14 +50,19 @@ async def _load_members():
         r.raise_for_status()
 
     _members_cache = {}
+    _members_by_id = {}
     for m in r.json().get("members", []):
-        name = m.get("username", "").strip()
-        uid  = m.get("id")
+        name  = m.get("username", "").strip()
+        uid   = m.get("id")
+        email = m.get("email", "")
         if name and uid:
             _members_cache[name.lower()] = (uid, name)
+            _members_by_id[uid] = {"name": name, "email": email}
 
     _members_fetched_at = now
     print(f"[ClickUp] Members refreshed ({len(_members_cache)}): {[v[1] for v in _members_cache.values()]}")
+
+
 
 
 def _match_participants(participants: list) -> tuple[list[int], list[str]]:
@@ -327,4 +341,195 @@ async def create_meeting_task(notes: dict, metadata: dict):
             )
             sub.raise_for_status()
         print(f"[ClickUp] Subtask: {topic.get('title')}")
+
+
+async def search_relevant_tasks(keywords: list[str]) -> list[dict]:
+    """
+    Searches ClickUp workspace for tasks matching each keyword (parallel).
+    Deduplicates by task ID. Returns flat list of {id, name, status, list}.
+    Scales to any number of tasks — ClickUp's search handles the heavy lifting.
+    """
+    import asyncio
+
+    async def search_one(keyword: str) -> list[dict]:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(
+                    f"{BASE_URL}/team/{CLICKUP_TEAM_ID}/task",
+                    headers=HEADERS,
+                    params={
+                        "search":         keyword,
+                        "include_closed": "false",
+                        "list_ids[]":     CLICKUP_BACKLOG_LIST_ID,
+                        "page":           0
+                    }
+                )
+                r.raise_for_status()
+            return r.json().get("tasks", [])
+        except Exception as e:
+            print(f"[ClickUp Search] '{keyword}' failed: {e}")
+            return []
+
+    # Run all keyword searches in parallel
+    results = await asyncio.gather(*[search_one(kw) for kw in keywords])
+
+    # Deduplicate by task ID
+    seen = set()
+    tasks = []
+    for batch in results:
+        for t in batch:
+            tid = t.get("id")
+            if tid and tid not in seen:
+                seen.add(tid)
+                tasks.append({
+                    "id":     tid,
+                    "name":   t.get("name", ""),
+                    "status": t.get("status", {}).get("status", ""),
+                    "list":   t.get("list", {}).get("name", ""),
+                })
+
+    print(f"[ClickUp Search] {len(keywords)} keywords -> {len(tasks)} unique tasks found")
+    return tasks
+
+
+async def match_and_get_emails(participant_names: list[str]) -> list[tuple]:
+    """
+    Matches participant names to ClickUp members and returns their emails.
+    Returns list of (clickup_id, display_name, email) for each matched participant.
+    Used by slack_notifier to look up Slack user IDs.
+    """
+    await _load_members()
+    matched_ids, _ = _match_participants(participant_names)
+    result = []
+    for uid in matched_ids:
+        info = _members_by_id.get(uid, {})
+        result.append((uid, info.get("name", ""), info.get("email", "")))
+    return result
+
+
+async def get_backlog_tasks() -> list[dict]:
+    """
+    Fetch all open tasks from the Backlog list (paginated).
+    Used to populate the modal dropdown when user clicks Change / Pick a Task.
+    """
+    tasks = []
+    page  = 0
+    while True:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                f"{BASE_URL}/list/{CLICKUP_BACKLOG_LIST_ID}/task",
+                headers=HEADERS,
+                params={"include_closed": "false", "page": page}
+            )
+            r.raise_for_status()
+        batch = r.json().get("tasks", [])
+        if not batch:
+            break
+        for t in batch:
+            assignees = t.get("assignees", [])
+            assignee_names = ", ".join(
+                a.get("username", "").split()[0]   # first name only
+                for a in assignees if a.get("username")
+            )
+            tasks.append({
+                "id":        t.get("id"),
+                "name":      t.get("name", ""),
+                "status":    t.get("status", {}).get("status", ""),
+                "assignees": assignee_names
+            })
+        if len(batch) < 100:   # ClickUp returns max 100 per page
+            break
+        page += 1
+    return tasks
+
+
+async def get_backlog_tasks_cached() -> list[dict]:
+    """
+    Returns all Backlog tasks from cache. Refreshes every 5 minutes.
+    Used by /webhook/slack-options so search responses are fast.
+    """
+    global _backlog_cache, _backlog_fetched_at
+    if _backlog_fetched_at and (time.time() - _backlog_fetched_at) < BACKLOG_TTL_SECS:
+        return _backlog_cache
+    _backlog_cache = await get_backlog_tasks()
+    _backlog_fetched_at = time.time()
+    print(f"[ClickUp] Backlog cache refreshed ({len(_backlog_cache)} tasks)")
+    return _backlog_cache
+
+
+def search_backlog_by_query(query: str, all_tasks: list[dict]) -> list[dict]:
+    """
+    Filter backlog tasks by query — matches task name OR assignee name (case-insensitive).
+    Called client-side from cached task list so it's instant regardless of task count.
+    """
+    q = query.lower()
+    matched = [
+        t for t in all_tasks
+        if q in t.get("name", "").lower() or q in t.get("assignees", "").lower()
+    ]
+    # Assigned tasks first within matches
+    assigned   = [t for t in matched if t.get("assignees")]
+    unassigned = [t for t in matched if not t.get("assignees")]
+    return (assigned + unassigned)[:100]
+
+
+async def create_backlog_task(name: str, description: str, due_date: str = "") -> dict:
+    """
+    Creates a new task in the Backlog list.
+    Called when user clicks 'Create New Task' from the Slack DM modal.
+    """
+    payload: dict = {
+        "name":                 name,
+        "markdown_description": description
+    }
+    if due_date:
+        try:
+            dt = datetime.strptime(due_date.strip(), "%Y-%m-%d")
+            payload["due_date"] = int(dt.timestamp() * 1000)
+        except Exception:
+            pass  # skip if date format is wrong
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            f"{BASE_URL}/list/{CLICKUP_BACKLOG_LIST_ID}/task",
+            headers=HEADERS,
+            json=payload
+        )
+        r.raise_for_status()
+    result = r.json()
+    print(f"[ClickUp] New Backlog task created: '{name}' (id: {result.get('id')})")
+    return result
+
+
+async def comment_already_exists(task_id: str, action_text: str) -> bool:
+    """
+    Check if a comment containing this action point already exists on the task.
+    Used to prevent duplicate posts when multiple participants confirm the same point.
+    """
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"{BASE_URL}/task/{task_id}/comment",
+            headers=HEADERS
+        )
+        r.raise_for_status()
+    for comment in r.json().get("comments", []):
+        existing = comment.get("comment_text", "")
+        if action_text.strip() and action_text.strip() in existing:
+            return True
+    return False
+
+
+async def post_task_comment(task_id: str, comment_text: str):
+    """
+    Posts a comment to a ClickUp task's Activity section.
+    ONLY called when a person manually confirms or selects a task in Slack — never automatic.
+    """
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            f"{BASE_URL}/task/{task_id}/comment",
+            headers=HEADERS,
+            json={"comment_text": comment_text, "notify_all": False}
+        )
+        r.raise_for_status()
+    print(f"[ClickUp] Comment posted to task {task_id}")
 

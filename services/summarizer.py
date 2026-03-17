@@ -77,6 +77,8 @@ The most important action items only — concrete and clearly committed to. Skip
 - task: Short, specific, actionable (max 15 words)
 - owner: Always null — there are no speaker labels so never assign ownership to any person
 - deadline: Only if explicitly stated, else null
+- clickup_task_id: If a ClickUp task from the context clearly matches this action item, put its ID here. Otherwise null.
+- clickup_task_name: The matching task name, or null.
 Max 8-10 items. Quality over quantity.
 
 ## blockers
@@ -140,8 +142,10 @@ If worth logging:
   "next_steps": [
     {
       "task": "Specific actionable task description.",
-      "owner": "Name or null",
-      "deadline": "Timeframe or null"
+      "owner": null,
+      "deadline": "Timeframe or null",
+      "clickup_task_id": "task_id if clearly matched, else null",
+      "clickup_task_name": "task name if matched, else null"
     }
   ],
   "blockers": [
@@ -165,9 +169,53 @@ If NOT worth logging:
 }"""
 
 
-async def structure_notes(transcript: str, participants: list, duration_minutes: int = 0) -> dict:
+async def extract_meeting_keywords(transcript: str) -> list[str]:
     """
-    Sends the English transcript to GPT
+    Extracts 10-15 search keywords from the full transcript using gpt-4o-mini.
+    Covers project names, client names, tool names, feature areas, and action themes.
+    These keywords are used to search ClickUp workspace for relevant tasks.
+    """
+    prompt = (
+        "Read this meeting transcript and extract 10-15 short keyword phrases that best "
+        "represent what was discussed. Cover ALL of:\n"
+        "- Project and product names (e.g. 'CIOs', 'Ladder', 'Agent Loopr')\n"
+        "- Client names (e.g. 'BN client', 'Storata', 'Jorge')\n"
+        "- Tool and tech names (e.g. '12Labs', 'Slack bot', 'vector DB')\n"
+        "- Work themes and features (e.g. 'scraper scripts', 'Upwork bidding', 'GitHub')\n"
+        "- Action areas discussed (e.g. 'hiring', 'architecture', 'notifications')\n\n"
+        "Rules: 1-3 words per keyword. Be specific, not generic. "
+        "Cover the whole meeting, not just the beginning.\n\n"
+        f"TRANSCRIPT:\n{transcript}\n\n"
+        "Return JSON: {\"keywords\": [\"keyword1\", \"keyword2\", ...]}"
+    )
+
+    try:
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_completion_tokens=256,
+            timeout=30
+        )
+        raw = json.loads(resp.choices[0].message.content)
+        keywords = raw.get("keywords") or next(iter(raw.values()), [])
+        keywords = [k for k in keywords if isinstance(k, str) and k.strip()]
+        print(f"[Keywords] Extracted {len(keywords)}: {keywords}")
+        return keywords
+    except Exception as e:
+        print(f"[Keywords] Extraction failed: {e} — no task context")
+        return []
+
+
+async def structure_notes(
+    transcript: str,
+    participants: list,
+    duration_minutes: int = 0,
+    relevant_tasks: list = None
+) -> dict:
+    """
+    Sends the English transcript to GPT.
+    relevant_tasks: optional flat list of [{id, name, status, list}] from ClickUp search
     Returns structured meeting notes as a dict.
     """
     participants_str = ", ".join(
@@ -175,9 +223,18 @@ async def structure_notes(transcript: str, participants: list, duration_minutes:
         for p in participants
     ) if participants else "Unknown"
 
+    # Build lightweight ClickUp context block (background only, kept short)
+    context_block = ""
+    if relevant_tasks:
+        lines = ["CLICKUP CONTEXT (background only — use to recognize transcript references, do not force-match):"]
+        for t in relevant_tasks:
+            lines.append(f"  [{t['id']}] {t['name']} | {t['list']} | {t['status']}")
+        context_block = "\n" + "\n".join(lines) + "\n"
+
     user_message = (
         f"Participants: {participants_str}\n"
-        f"Meeting duration: {duration_minutes} minutes\n\n"
+        f"Meeting duration: {duration_minutes} minutes\n"
+        f"{context_block}\n"
         f"TRANSCRIPT:\n{transcript}"
     )
 
