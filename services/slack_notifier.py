@@ -143,7 +143,9 @@ async def send_meeting_dms(notes: dict, metadata: dict):
         dt_str = dt_ist.strftime("%d %b, %I:%M %p")
     except Exception:
         dt_str = datetime.now().strftime("%d %b, %I:%M %p")
-    fallback_text = f"Meeting Notes | {dt_str} IST"
+    title = notes.get("meeting_title", "Huddle Meeting")
+    short_title = title[:40] + "…" if len(title) > 40 else title
+    fallback_text = f"Meeting Notes | {dt_str} IST · {short_title}"
 
     for name in participant_names:
         slack_user_id = _match_slack_user(name)
