@@ -5,3 +5,4 @@ python-dotenv
 openai
 upstash-redis
 slack-sdk
+python-multipart
