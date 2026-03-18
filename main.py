@@ -419,7 +419,6 @@ async def slack_webhook(request: Request, background_tasks: BackgroundTasks):
     if event_type == "channel_huddle_updated":
         huddle = event.get("huddle", {})
         channel_id = event.get("channel_id", "")
-        print(f"[AutoJoin] huddle object keys: {list(huddle.keys())}, channel: {channel_id}")
         attendee_count = huddle.get("attendee_count", 0)
 
         # Only send bot when huddle first starts (attendee_count = 1 = first person joined)
