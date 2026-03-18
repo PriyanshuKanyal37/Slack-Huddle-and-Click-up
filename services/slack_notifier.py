@@ -145,7 +145,8 @@ async def send_meeting_dms(notes: dict, metadata: dict):
         dt_str = datetime.now().strftime("%d %b, %I:%M %p")
     title = notes.get("meeting_title", "Huddle Meeting")
     short_title = title[:40] + "…" if len(title) > 40 else title
-    fallback_text = f"Meeting Notes | {dt_str} IST · {short_title}"
+    first_names = ", ".join(n.split()[0] for n in participant_names if n)
+    fallback_text = f"🎙️ {dt_str} IST · {short_title} · {first_names}"
 
     for name in participant_names:
         slack_user_id = _match_slack_user(name)

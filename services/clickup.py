@@ -12,7 +12,7 @@ CLICKUP_BACKLOG_LIST_ID = os.getenv("CLICKUP_BACKLOG_LIST_ID") # Backlog list �
 CLICKUP_TEAM_ID       = "9017847781"
 BASE_URL         = "https://api.clickup.com/api/v2"
 DATE_FIELD_ID    = "00a57e74-5b15-42da-8e6d-7163977c66ce"  # custom "Date" field
-MEMBERS_TTL_SECS = 3600  # re-fetch ClickUp members every 1 hour
+MEMBERS_TTL_SECS = 60    # re-fetch ClickUp members every 1 minute
 BACKLOG_TTL_SECS = 300   # re-fetch backlog tasks every 5 minutes
 
 HEADERS = {
@@ -123,11 +123,21 @@ def _match_participants(participants: list) -> tuple[list[int], list[str]]:
 
 
 def _parse_datetime(iso_str: str):
+    """Returns IST datetime (UTC+5:30) — for display purposes only."""
     try:
         dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
         return dt + timedelta(hours=5, minutes=30)
     except Exception:
         return datetime.now()
+
+
+def _to_epoch_ms(iso_str: str) -> int:
+    """Converts UTC ISO string to Unix epoch milliseconds — for ClickUp API."""
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return int(datetime.now().timestamp() * 1000)
 
 
 def _build_task_description(notes: dict, metadata: dict, unmatched_participants: list) -> str:
@@ -288,10 +298,9 @@ async def create_meeting_task(notes: dict, metadata: dict):
 
     matched_ids, unmatched = _match_participants(participant_names)
 
-    # Parse meeting start time → Unix ms for ClickUp
-    started    = metadata.get("started_at", "")
-    start_dt   = _parse_datetime(started)
-    start_ms   = int(start_dt.timestamp() * 1000)
+    # Parse meeting start time → Unix ms for ClickUp (UTC epoch, no IST offset)
+    started  = metadata.get("started_at", "")
+    start_ms = _to_epoch_ms(started)
 
     # Task name = just the meeting title
     title     = notes.get("meeting_title", "Huddle Meeting")
@@ -473,11 +482,123 @@ def search_backlog_by_query(query: str, all_tasks: list[dict]) -> list[dict]:
     return (assigned + unassigned)[:100]
 
 
-async def create_backlog_task(name: str, description: str, due_date: str = "") -> dict:
+async def validate_clickup_api_key(api_key: str) -> tuple[bool, str]:
     """
-    Creates a new task in the Backlog list.
-    Called when user clicks 'Create New Task' from the Slack DM modal.
+    Validates a ClickUp API key by calling GET /user.
+    Returns (True, display_name) if valid, (False, "") if not.
     """
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{BASE_URL}/user",
+                headers={"Authorization": api_key, "Content-Type": "application/json"}
+            )
+        if r.status_code == 200:
+            user = r.json().get("user", {})
+            name = user.get("username", "") or user.get("email", "Unknown")
+            return True, name
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+CUSTOM_FIELD_BRAND        = "2243c0ae-20c7-4ae5-80e1-9a71567f4013"
+CUSTOM_FIELD_PROJECT_TYPE = "1996e5f4-d942-4f43-8f28-6ecf6a3ac52e"
+CUSTOM_FIELD_THEME        = "fc9aafb6-d93b-4794-99e2-0672c4ecb10c"
+CUSTOM_FIELDS_TTL_SECS    = 60    # re-fetch custom field options every 1 minute
+
+_custom_fields_cache:      dict  = {}
+_custom_fields_fetched_at: float = 0
+
+_backlog_members_cache:      list  = []   # [{"id": int, "name": str}]
+_backlog_members_fetched_at: float = 0
+
+
+async def get_backlog_members() -> list[dict]:
+    """
+    Fetch all members of the Backlog list from ClickUp.
+    Cached for 1 hour — auto-refreshes when team changes.
+    Returns: [{"id": int, "name": str}]
+    """
+    global _backlog_members_cache, _backlog_members_fetched_at
+
+    if _backlog_members_fetched_at and (time.time() - _backlog_members_fetched_at) < MEMBERS_TTL_SECS:
+        return _backlog_members_cache
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                f"{BASE_URL}/list/{CLICKUP_BACKLOG_LIST_ID}/member",
+                headers=HEADERS
+            )
+            r.raise_for_status()
+        _backlog_members_cache = [
+            {"id": m["id"], "name": m.get("username", "Unknown")}
+            for m in r.json().get("members", [])
+            if m.get("id") and m.get("username")
+        ]
+        _backlog_members_fetched_at = time.time()
+        print(f"[ClickUp] Backlog members refreshed ({len(_backlog_members_cache)})")
+    except Exception as e:
+        print(f"[ClickUp] get_backlog_members failed: {e} — using cached")
+
+    return _backlog_members_cache
+
+
+async def get_backlog_custom_fields() -> dict:
+    """
+    Fetch Brand, Project Type, and Theme dropdown options from ClickUp.
+    Cached for 1 hour — auto-refreshes if options change in ClickUp.
+    Returns: {field_id: [{"id": option_id, "name": option_name}]}
+    """
+    global _custom_fields_cache, _custom_fields_fetched_at
+
+    if _custom_fields_fetched_at and (time.time() - _custom_fields_fetched_at) < CUSTOM_FIELDS_TTL_SECS:
+        return _custom_fields_cache
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                f"{BASE_URL}/list/{CLICKUP_BACKLOG_LIST_ID}/field",
+                headers=HEADERS
+            )
+            r.raise_for_status()
+        result = {}
+        for field in r.json().get("fields", []):
+            fid = field.get("id")
+            if fid in (CUSTOM_FIELD_BRAND, CUSTOM_FIELD_PROJECT_TYPE, CUSTOM_FIELD_THEME):
+                options = field.get("type_config", {}).get("options", [])
+                result[fid] = [{"id": o["id"], "name": o["name"]} for o in options]
+        _custom_fields_cache     = result
+        _custom_fields_fetched_at = time.time()
+        print(f"[ClickUp] Custom fields refreshed from API")
+    except Exception as e:
+        print(f"[ClickUp] get_backlog_custom_fields failed: {e} — using cached")
+
+    return _custom_fields_cache
+
+
+async def create_backlog_task(
+    name: str,
+    description: str,
+    due_date: str = "",
+    api_key: str = None,
+    assignees: list = None,
+    priority: int = None,
+    brand_option_id: str = None,
+    project_type_option_id: str = None,
+    theme_option_id: str = None
+) -> dict:
+    """
+    Creates a new task in the Backlog list with optional assignees, priority,
+    and custom fields (Brand, Project Type, Theme).
+    """
+    global _backlog_fetched_at
+
+    headers = {
+        "Authorization": api_key or CLICKUP_API_KEY,
+        "Content-Type":  "application/json"
+    }
     payload: dict = {
         "name":                 name,
         "markdown_description": description
@@ -487,16 +608,31 @@ async def create_backlog_task(name: str, description: str, due_date: str = "") -
             dt = datetime.strptime(due_date.strip(), "%Y-%m-%d")
             payload["due_date"] = int(dt.timestamp() * 1000)
         except Exception:
-            pass  # skip if date format is wrong
+            pass
+    if assignees:
+        payload["assignees"] = assignees
+    if priority:
+        payload["priority"] = priority
+
+    custom_fields = []
+    if brand_option_id:
+        custom_fields.append({"id": CUSTOM_FIELD_BRAND, "value": brand_option_id})
+    if project_type_option_id:
+        custom_fields.append({"id": CUSTOM_FIELD_PROJECT_TYPE, "value": project_type_option_id})
+    if theme_option_id:
+        custom_fields.append({"id": CUSTOM_FIELD_THEME, "value": theme_option_id})
+    if custom_fields:
+        payload["custom_fields"] = custom_fields
 
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
             f"{BASE_URL}/list/{CLICKUP_BACKLOG_LIST_ID}/task",
-            headers=HEADERS,
+            headers=headers,
             json=payload
         )
         r.raise_for_status()
     result = r.json()
+    _backlog_fetched_at = 0  # invalidate cache so new task appears immediately
     print(f"[ClickUp] New Backlog task created: '{name}' (id: {result.get('id')})")
     return result
 
@@ -519,15 +655,20 @@ async def comment_already_exists(task_id: str, action_text: str) -> bool:
     return False
 
 
-async def post_task_comment(task_id: str, comment_text: str):
+async def post_task_comment(task_id: str, comment_text: str, api_key: str = None):
     """
     Posts a comment to a ClickUp task's Activity section.
-    ONLY called when a person manually confirms or selects a task in Slack — never automatic.
+    Uses the provided api_key so the comment shows under that user's name in ClickUp.
+    Falls back to default CLICKUP_API_KEY if no key provided.
     """
+    headers = {
+        "Authorization": api_key or CLICKUP_API_KEY,
+        "Content-Type":  "application/json"
+    }
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
             f"{BASE_URL}/task/{task_id}/comment",
-            headers=HEADERS,
+            headers=headers,
             json={"comment_text": comment_text, "notify_all": False}
         )
         r.raise_for_status()

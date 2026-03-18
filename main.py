@@ -48,7 +48,7 @@ app = FastAPI()
 
 POLL_INTERVAL_SECONDS   = 120   # poll every 2 minute as backup
 in_progress: set        = set()  # bots currently being processed
-failed_bots: set        = set()  # bots that failed — skip until server restarts
+failed_bots: dict       = {}     # bot_id → failure count; skip after 3 failures
 active_huddles: set     = set()  # channel IDs where a Recall bot was already sent
 
 
@@ -213,7 +213,7 @@ async def get_bot_details(bot_id: str) -> dict:
 
 async def run_pipeline(bot_id: str):
     # Prevent duplicate processing (webhook + poller running at same time)
-    if await is_processed(bot_id) or bot_id in in_progress or bot_id in failed_bots:
+    if await is_processed(bot_id) or bot_id in in_progress or failed_bots.get(bot_id, 0) >= 3:
         print(f"[Pipeline] Bot {bot_id} already processed/in-progress/failed. Skipping.")
         return
 
@@ -343,9 +343,11 @@ async def run_pipeline(bot_id: str):
 
     except Exception as e:
         in_progress.discard(bot_id)
-        failed_bots.add(bot_id)
-        print(f"[Pipeline] ERROR for bot {bot_id}: {e}")
-        print(f"[Pipeline] Bot added to failed list — won't retry until server restarts.")
+        count = failed_bots.get(bot_id, 0) + 1
+        failed_bots[bot_id] = count
+        print(f"[Pipeline] ERROR for bot {bot_id} (attempt {count}/3): {e}")
+        if count >= 3:
+            print(f"[Pipeline] Bot {bot_id} failed 3 times — skipping permanently.")
 
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
@@ -404,9 +406,14 @@ async def slack_webhook(request: Request, background_tasks: BackgroundTasks):
     event = payload.get("event", {})
     event_type = event.get("type", "")
 
-    # Log all events during initial setup so we can see exact Slack payload format
     print(f"[Slack] Event: {event_type}")
-    print(f"[Slack] Payload: {json.dumps(event, indent=2)}")
+
+    # Handle DM messages — used for API key updates (user pastes pk_xxx in bot DM)
+    if event_type == "message" and event.get("channel_type") == "im":
+        # Ignore bot's own messages
+        if not event.get("bot_id") and not event.get("subtype"):
+            background_tasks.add_task(_handle_dm_message, event)
+        return {"status": "ok"}
 
     # Detect huddle start — fires when first person joins a huddle in a channel
     if event_type == "channel_huddle_updated":
@@ -429,6 +436,65 @@ async def slack_webhook(request: Request, background_tasks: BackgroundTasks):
             print(f"[AutoJoin] Huddle ended in {channel_id}. Channel cleared.")
 
     return {"status": "ok"}
+
+
+async def _handle_dm_message(event: dict):
+    """
+    Handles DMs sent to the bot.
+    - If user types 'apikey', 'api key', or 'api' → send instructions
+    - If message starts with pk_ → validate and save as ClickUp API key
+    """
+    from services.clickup import validate_clickup_api_key
+    from upstash_redis.asyncio import Redis as _Redis
+
+    user_id  = event.get("user", "")
+    text     = (event.get("text") or "").strip()
+    channel  = event.get("channel", "")
+
+    slack_headers = {
+        "Authorization": f"Bearer {os.getenv('SLACK_BOT_TOKEN')}",
+        "Content-Type": "application/json"
+    }
+
+    # Keyword trigger — send instructions
+    if text.lower() in ("apikey", "api key", "api"):
+        instructions = (
+            "*How to get your ClickUp API key:*\n"
+            "1. Open ClickUp\n"
+            "2. Right-click your avatar (top-right corner)\n"
+            "3. Click *Settings*\n"
+            "4. Click *ClickUp API*\n"
+            "5. Generate your token and paste it here"
+        )
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                "https://slack.com/api/chat.postMessage",
+                headers=slack_headers,
+                json={"channel": channel, "text": instructions}
+            )
+        return
+
+    # API key submission
+    if not text.startswith("pk_"):
+        return  # ignore everything else
+
+    _redis = _Redis(url=os.getenv("UPSTASH_REDIS_URL"), token=os.getenv("UPSTASH_REDIS_TOKEN"))
+    valid, name = await validate_clickup_api_key(text)
+
+    if valid:
+        await _redis.set(f"clickup_key:{user_id}", text)
+        reply = f":white_check_mark: Verified and saved — connected as *{name}*"
+        print(f"[Slack DM] API key saved for {user_id} ({name})")
+    else:
+        reply = ":x: Invalid API key. Please check and try again."
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(
+            "https://slack.com/api/chat.postMessage",
+            headers=slack_headers,
+            json={"channel": channel, "text": reply}
+        )
+
 
 
 @app.post("/webhook/slack-options")

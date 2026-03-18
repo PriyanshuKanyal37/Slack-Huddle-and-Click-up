@@ -249,5 +249,10 @@ async def structure_notes(
         timeout=180
     )
 
-    notes = json.loads(response.choices[0].message.content)
+    try:
+        notes = json.loads(response.choices[0].message.content)
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"[Summarizer] Failed to parse GPT response as JSON: {e}")
+        print(f"[Summarizer] Raw response: {response.choices[0].message.content[:500]}")
+        raise ValueError(f"GPT returned invalid JSON: {e}")
     return notes
