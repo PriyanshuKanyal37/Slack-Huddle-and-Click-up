@@ -75,6 +75,7 @@ Only if a concrete technical/operational approach was discussed. Keep to 4-6 ste
 ## next_steps
 The most important action items only — concrete and clearly committed to. Skip vague "we should think about" items. Each:
 - task: Short, specific, actionable (max 15 words)
+- context: 3-5 sentences of what was specifically discussed in the meeting that led to this action item. Be detailed — include the actual problem raised, the reasoning behind the decision, tools or names mentioned, and any important nuance. Write in past tense. This will be shown in ClickUp so a reader with no meeting context must fully understand what happened.
 - owner: Always null — there are no speaker labels so never assign ownership to any person
 - deadline: Only if explicitly stated, else null
 - clickup_task_id: If a ClickUp task from the context clearly matches this action item, put its ID here. Otherwise null.
@@ -142,6 +143,7 @@ If worth logging:
   "next_steps": [
     {
       "task": "Specific actionable task description.",
+      "context": "3-5 sentences explaining what was discussed that led to this action item.",
       "owner": null,
       "deadline": "Timeframe or null",
       "clickup_task_id": "task_id if clearly matched, else null",

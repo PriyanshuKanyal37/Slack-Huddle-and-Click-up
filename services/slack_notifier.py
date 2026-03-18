@@ -216,9 +216,7 @@ def _build_dm_blocks(notes: dict, metadata: dict) -> list:
         date_str = datetime.now().strftime("%d %b %Y")
 
     meta_for_buttons = {
-        "meeting_title":    title,
-        "participants_str": participants_str[:200],
-        "overview":         overview[:500]
+        "participants_str": participants_str[:200]
     }
 
     blocks = [
@@ -273,8 +271,11 @@ def _build_dm_blocks(notes: dict, metadata: dict) -> list:
             }
         })
 
+        task_context = step.get("context", "")
+
         button_value = json.dumps({
             "task_text":         task_text[:300],
+            "task_context":      task_context[:1200],
             "clickup_task_id":   task_id,
             "clickup_task_name": task_name or "",
             "deadline":          deadline or "",
@@ -282,9 +283,10 @@ def _build_dm_blocks(notes: dict, metadata: dict) -> list:
         })
 
         create_value = json.dumps({
-            "task_text": task_text[:300],
-            "deadline":  deadline or "",
-            "meta":      meta_for_buttons
+            "task_text":    task_text[:300],
+            "task_context": task_context[:1200],
+            "deadline":     deadline or "",
+            "meta":         meta_for_buttons
         })
 
         create_btn = {

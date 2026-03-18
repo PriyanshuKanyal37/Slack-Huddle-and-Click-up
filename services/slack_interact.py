@@ -67,11 +67,12 @@ async def _handle_confirm(action: dict, response_url: str, slack_user_id: str, t
     """
     from services.clickup import post_task_comment, comment_already_exists
 
-    value     = json.loads(action.get("value", "{}"))
-    task_id   = value.get("clickup_task_id")
-    task_name = value.get("clickup_task_name", "")
-    task_text = value.get("task_text", "")
-    meta      = value.get("meta", {})
+    value        = json.loads(action.get("value", "{}"))
+    task_id      = value.get("clickup_task_id")
+    task_name    = value.get("clickup_task_name", "")
+    task_text    = value.get("task_text", "")
+    task_context = value.get("task_context", "")
+    meta         = value.get("meta", {})
 
     if not task_id:
         await _respond_url(response_url, ":x: No ClickUp task ID found — could not post comment.")
@@ -86,7 +87,7 @@ async def _handle_confirm(action: dict, response_url: str, slack_user_id: str, t
         await _respond_url(response_url, f":information_source: Already posted to *{task_name}* by someone else.")
         return
 
-    comment = _build_comment(task_text, meta)
+    comment = _build_comment(task_text, meta, task_context)
     try:
         await post_task_comment(task_id, comment, api_key=api_key)
         await _respond_url(response_url, f":white_check_mark: Posted to *{task_name}*")
@@ -209,10 +210,11 @@ async def _handle_api_key_submit(payload: dict):
 
     # Re-execute original action
     if pending_action == "confirm":
-        task_id   = action_value.get("clickup_task_id")
-        task_name = action_value.get("clickup_task_name", "")
-        task_text = action_value.get("task_text", "")
-        meta      = action_value.get("meta", {})
+        task_id      = action_value.get("clickup_task_id")
+        task_name    = action_value.get("clickup_task_name", "")
+        task_text    = action_value.get("task_text", "")
+        task_context = action_value.get("task_context", "")
+        meta         = action_value.get("meta", {})
 
         if not task_id:
             await _respond_url(response_url, f":white_check_mark: ClickUp connected as *{clickup_name}*!")
@@ -222,7 +224,7 @@ async def _handle_api_key_submit(payload: dict):
             await _respond_url(response_url, f":information_source: Already posted to *{task_name}*.")
             return
 
-        comment = _build_comment(task_text, meta)
+        comment = _build_comment(task_text, meta, task_context)
         try:
             await post_task_comment(task_id, comment, api_key=api_key)
             await _respond_url(response_url, f":white_check_mark: Connected as *{clickup_name}* · Posted to *{task_name}*")
@@ -249,6 +251,7 @@ async def _open_create_task_modal(trigger_id: str, action_value: dict, response_
 
     private_metadata = json.dumps({
         "task_text":    task_text,
+        "task_context": action_value.get("task_context", ""),
         "meta":         action_value.get("meta", {}),
         "response_url": response_url
     })
@@ -401,6 +404,7 @@ async def _handle_create_task_submit(payload: dict):
     task_name    = state.get("task_name", {}).get("name_input", {}).get("value", "").strip()
     due_date     = (state.get("due_date", {}).get("due_date_input", {}).get("value") or "").strip()
     task_text    = private_metadata.get("task_text", "")
+    task_context = private_metadata.get("task_context", "")
     meta         = private_metadata.get("meta", {})
     response_url = private_metadata.get("response_url", "")
 
@@ -429,7 +433,7 @@ async def _handle_create_task_submit(payload: dict):
         return
 
     api_key = await _get_user_clickup_key(slack_user_id)
-    comment = _build_comment(task_text, meta)
+    comment = _build_comment(task_text, meta, task_context)
     try:
         result = await create_backlog_task(
             task_name, "", due_date,
@@ -515,6 +519,7 @@ async def _handle_modal_submit(payload: dict):
     selected_name = selected_opt.get("text", {}).get("text", "")
 
     task_text    = private_metadata.get("task_text", "")
+    task_context = private_metadata.get("task_context", "")
     meta         = private_metadata.get("meta", {})
     response_url = private_metadata.get("response_url", "")
 
@@ -527,7 +532,7 @@ async def _handle_modal_submit(payload: dict):
         return
 
     api_key = await _get_user_clickup_key(slack_user_id)
-    comment = _build_comment(task_text, meta)
+    comment = _build_comment(task_text, meta, task_context)
     try:
         await post_task_comment(selected_id, comment, api_key=api_key)
         await _respond_url(response_url, f":white_check_mark: Posted to *{selected_name}*")
@@ -536,27 +541,35 @@ async def _handle_modal_submit(payload: dict):
         await _respond_url(response_url, f":x: Failed to post comment: {e}")
 
 
-def _build_comment(task_text: str, meta: dict) -> str:
+def _build_comment(task_text: str, meta: dict, task_context: str = "") -> str:
     """
     Build the comment text posted to ClickUp task Activity.
-    Format: date/time IST · participants · discussion overview · action point
+    Format: date · what was discussed · action point · participants
     """
     now_ist  = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     date_str = now_ist.strftime("%d %b %Y, %I:%M %p IST")
 
     participants_str = meta.get("participants_str", "")
-    overview         = meta.get("overview", "")
 
-    lines = [date_str]
-    if participants_str:
-        lines.append(f"Participants: {participants_str}")
-    if overview:
+    lines = [f"🗓️ {date_str}"]
+
+    if task_context:
         lines.append("")
-        lines.append("Discussion:")
-        lines.append(overview)
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("💬  What Was Discussed")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append(task_context)
+
     lines.append("")
-    lines.append("Action Point:")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("✅  Action Point")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append(task_text)
+
+    if participants_str:
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"👥  Participants: {participants_str}")
 
     return "\n".join(lines)
 
