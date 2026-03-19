@@ -4,6 +4,7 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+from upstash_redis.asyncio import Redis as _UpstashRedis
 
 load_dotenv()
 
@@ -12,6 +13,13 @@ HEADERS = {
     "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
     "Content-Type": "application/json"
 }
+
+_redis = _UpstashRedis(
+    url=os.getenv("UPSTASH_REDIS_URL"),
+    token=os.getenv("UPSTASH_REDIS_TOKEN")
+)
+
+DM_SESSION_TTL = 7 * 24 * 60 * 60   # 7 days — DM state expires after a week
 
 # Cache of all Slack workspace users — refreshed every hour
 _slack_users_cache: list = []        # [{id, real_name, display_name}]
@@ -115,12 +123,15 @@ def _match_slack_user(name: str) -> str | None:
 async def send_meeting_dms(notes: dict, metadata: dict):
     """
     Send meeting summary DMs to all participants.
-    Matches participant names directly to Slack users — no email needed.
+    Stores session data + per-DM ts/channel in Redis so buttons can
+    silently update all threads when any participant acts on an action item.
     """
     if not notes.get("worth_logging", True):
         return
 
+    meeting_id   = metadata.get("meeting_id", "")
     participants = metadata.get("participants", [])
+
     participant_names = []
     for p in participants:
         if isinstance(p, dict):
@@ -135,7 +146,42 @@ async def send_meeting_dms(notes: dict, metadata: dict):
 
     await _load_slack_users()
 
-    blocks       = _build_dm_blocks(notes, metadata)
+    # Build participants_str once — used in header and stored in session
+    parts = []
+    for p in participants:
+        if isinstance(p, dict):
+            parts.append(p.get("name") or p.get("display_name") or "")
+        else:
+            parts.append(str(p))
+    participants_str = " · ".join(p for p in parts if p) or "Unknown"
+
+    # Store session so slack_interact can rebuild blocks for chat.update
+    if meeting_id:
+        try:
+            session_data = {
+                "notes": {
+                    "meeting_title": notes.get("meeting_title", ""),
+                    "overview":      notes.get("overview", ""),
+                    "next_steps":    notes.get("next_steps", [])
+                },
+                "metadata": {
+                    "duration_minutes": metadata.get("duration_minutes", 0),
+                    "participants":     metadata.get("participants", []),
+                    "started_at":       metadata.get("started_at", ""),
+                    "participants_str": participants_str
+                }
+            }
+            await _redis.set(
+                f"dm_session:{meeting_id}",
+                json.dumps(session_data),
+                ex=DM_SESSION_TTL
+            )
+            print(f"[Slack DM] Session stored for meeting {meeting_id}")
+        except Exception as e:
+            print(f"[Slack DM] Failed to store session data: {e}")
+
+    blocks = _build_dm_blocks(notes, metadata, meeting_id=meeting_id)
+
     started = metadata.get("started_at", "")
     try:
         dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
@@ -143,7 +189,7 @@ async def send_meeting_dms(notes: dict, metadata: dict):
         dt_str = dt_ist.strftime("%d %b, %I:%M %p")
     except Exception:
         dt_str = datetime.now().strftime("%d %b, %I:%M %p")
-    title = notes.get("meeting_title", "Huddle Meeting")
+    title       = notes.get("meeting_title", "Huddle Meeting")
     short_title = title[:40] + "…" if len(title) > 40 else title
     first_names = ", ".join(n.split()[0] for n in participant_names if n)
     fallback_text = f"🎙️ {dt_str} IST · {short_title} · {first_names}"
@@ -181,6 +227,19 @@ async def send_meeting_dms(notes: dict, metadata: dict):
             resp_data = msg_resp.json()
             if resp_data.get("ok"):
                 print(f"[Slack DM] Sent to '{name}' (id: {slack_user_id})")
+                # Store ts + channel so we can chat.update later
+                msg_ts = resp_data.get("ts", "")
+                if meeting_id and msg_ts:
+                    try:
+                        await _redis.set(
+                            f"dm_msg:{meeting_id}:{slack_user_id}",
+                            json.dumps({"ts": msg_ts, "channel": channel_id}),
+                            ex=DM_SESSION_TTL
+                        )
+                        await _redis.lpush(f"dm_participants:{meeting_id}", slack_user_id)
+                        await _redis.expire(f"dm_participants:{meeting_id}", DM_SESSION_TTL)
+                    except Exception as e:
+                        print(f"[Slack DM] Failed to store DM info for '{name}': {e}")
             else:
                 print(f"[Slack DM] Failed for '{name}': {resp_data.get('error')}")
 
@@ -188,15 +247,24 @@ async def send_meeting_dms(notes: dict, metadata: dict):
             print(f"[Slack DM] Error sending to '{name}': {e}")
 
 
-def _build_dm_blocks(notes: dict, metadata: dict) -> list:
+def _build_dm_blocks(
+    notes: dict,
+    metadata: dict,
+    meeting_id: str = "",
+    action_states: dict = None
+) -> list:
     """
     Build Slack Block Kit blocks for the meeting DM.
-    Contains: header, overview, action points with Confirm / Change buttons.
+
+    action_states: optional dict of {str(step_index): {"confirmed_by_name": str, "task_name": str}}
+                   When provided, steps in this dict render as done (✅ + Edit button).
+    meeting_id:    When present, button values are tiny Redis pointers {"mid": ..., "si": i}.
+                   When absent (old/fallback messages), full data is embedded in the button value.
     """
-    title      = notes.get("meeting_title", "Huddle Meeting")
-    overview   = notes.get("overview", "")
-    next_steps = notes.get("next_steps", [])
-    duration   = metadata.get("duration_minutes", 0)
+    title        = notes.get("meeting_title", "Huddle Meeting")
+    overview     = notes.get("overview", "")
+    next_steps   = notes.get("next_steps", [])
+    duration     = metadata.get("duration_minutes", 0)
     participants = metadata.get("participants", [])
 
     parts = []
@@ -214,10 +282,6 @@ def _build_dm_blocks(notes: dict, metadata: dict) -> list:
         date_str = dt_ist.strftime("%d %b %Y")
     except Exception:
         date_str = datetime.now().strftime("%d %b %Y")
-
-    meta_for_buttons = {
-        "participants_str": participants_str[:200]
-    }
 
     blocks = [
         {"type": "divider"},
@@ -251,18 +315,41 @@ def _build_dm_blocks(notes: dict, metadata: dict) -> list:
         if not isinstance(step, dict):
             continue
 
-        task_text  = step.get("task", "")
-        task_id    = step.get("clickup_task_id")
-        task_name  = step.get("clickup_task_name")
-        deadline   = step.get("deadline")
+        task_text = step.get("task", "")
+        task_id   = step.get("clickup_task_id")
+        task_name = step.get("clickup_task_name")
+        deadline  = step.get("deadline")
 
+        # ── Done state: action already taken on this item ──────────────────────
+        if action_states and str(i) in action_states:
+            state        = action_states[str(i)]
+            confirmed_by = state.get("confirmed_by_name", "Someone")
+            posted_to    = state.get("task_name", "a task")
+            done_text    = f"*{i}.* {task_text}\n✅ {confirmed_by} posted to *{posted_to}*"
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": done_text}
+            })
+            # Edit button — shown to everyone so anyone can re-map the action item
+            if meeting_id:
+                blocks.append({
+                    "type": "actions",
+                    "elements": [{
+                        "type":      "button",
+                        "text":      {"type": "plain_text", "text": "Edit"},
+                        "action_id": f"edit_{i}",
+                        "value":     json.dumps({"mid": meeting_id, "si": i})
+                    }]
+                })
+            continue
+
+        # ── Pending state: show suggestion + action buttons ────────────────────
         deadline_str = f"\n_Deadline: {deadline}_" if deadline else ""
         suggestion = (
             f":bulb: Suggested \u2192 *{task_name}*"
             if task_id else
             ":bulb: No existing task matched"
         )
-
         blocks.append({
             "type": "section",
             "text": {
@@ -271,29 +358,34 @@ def _build_dm_blocks(notes: dict, metadata: dict) -> list:
             }
         })
 
-        task_context = step.get("context", "")
-
-        button_value = json.dumps({
-            "task_text":         task_text[:300],
-            "task_context":      task_context[:1200],
-            "clickup_task_id":   task_id,
-            "clickup_task_name": task_name or "",
-            "deadline":          deadline or "",
-            "meta":              meta_for_buttons
-        })
-
-        create_value = json.dumps({
-            "task_text":    task_text[:300],
-            "task_context": task_context[:1200],
-            "deadline":     deadline or "",
-            "meta":         meta_for_buttons
-        })
+        # Button values: tiny Redis pointer if meeting_id available (no overflow risk),
+        # otherwise full data embedded (backward compat for messages sent before this deploy).
+        if meeting_id:
+            btn_val    = json.dumps({"mid": meeting_id, "si": i})
+            create_val = json.dumps({"mid": meeting_id, "si": i})
+        else:
+            task_context  = step.get("context", "")
+            meta_for_btns = {"participants_str": participants_str[:200]}
+            btn_val = json.dumps({
+                "task_text":         task_text[:300],
+                "task_context":      task_context[:1200],
+                "clickup_task_id":   task_id,
+                "clickup_task_name": task_name or "",
+                "deadline":          deadline or "",
+                "meta":              meta_for_btns
+            })
+            create_val = json.dumps({
+                "task_text":    task_text[:300],
+                "task_context": task_context[:1200],
+                "deadline":     deadline or "",
+                "meta":         meta_for_btns
+            })
 
         create_btn = {
             "type":      "button",
             "text":      {"type": "plain_text", "text": "Create New Task"},
             "action_id": f"create_{i}",
-            "value":     create_value
+            "value":     create_val
         }
 
         if task_id:
@@ -305,13 +397,13 @@ def _build_dm_blocks(notes: dict, metadata: dict) -> list:
                         "text":      {"type": "plain_text", "text": "Confirm"},
                         "style":     "primary",
                         "action_id": f"confirm_{i}",
-                        "value":     button_value
+                        "value":     btn_val
                     },
                     {
                         "type":      "button",
                         "text":      {"type": "plain_text", "text": "Change Task"},
                         "action_id": f"change_{i}",
-                        "value":     button_value
+                        "value":     btn_val
                     },
                     create_btn
                 ]
@@ -324,7 +416,7 @@ def _build_dm_blocks(notes: dict, metadata: dict) -> list:
                         "type":      "button",
                         "text":      {"type": "plain_text", "text": "Pick a Task"},
                         "action_id": f"pick_{i}",
-                        "value":     button_value
+                        "value":     btn_val
                     },
                     create_btn
                 ]

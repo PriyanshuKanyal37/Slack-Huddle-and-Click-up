@@ -46,7 +46,7 @@ redis = Redis(
 
 app = FastAPI()
 
-POLL_INTERVAL_SECONDS   = 120   # poll every 2 minute as backup
+POLL_INTERVAL_SECONDS   = 1800   # poll every 30 minutes as backup (webhook is primary trigger)
 in_progress: set        = set()  # bots currently being processed
 failed_bots: dict       = {}     # bot_id → failure count; skip after 3 failures
 active_huddles: set     = set()  # channel IDs where a Recall bot was already sent
@@ -272,6 +272,7 @@ async def run_pipeline(bot_id: str):
             pass
 
         metadata = {
+            "meeting_id": bot_id,
             "participants": participants,
             "started_at": details.get("join_at", ""),
             "ended_at": ended_at,
