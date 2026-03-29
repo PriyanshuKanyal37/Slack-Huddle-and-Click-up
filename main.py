@@ -37,7 +37,7 @@ RECALL_BASE_URL       = "https://ap-northeast-1.recall.ai/api/v1"
 RECALL_MAX_RETRIES    = 5
 RECALL_WEBHOOK_SECRET = os.getenv("RECALL_WEBHOOK_SECRET", "")
 SLACK_SIGNING_SECRET  = os.getenv("SLACK_SIGNING_SECRET", "")
-BOT_KEY_TTL           = 14 * 24 * 60 * 60   # 14 days in seconds
+BOT_KEY_TTL           = 90 * 24 * 60 * 60   # 90 days in seconds
 
 redis = Redis(
     url=os.getenv("UPSTASH_REDIS_URL"),
@@ -93,7 +93,23 @@ async def poll_once():
         return
 
     all_bots = response.json().get("results", [])
-    new_bots = [b for b in all_bots if not await is_processed(b["id"])]
+    cutoff   = datetime.now(timezone.utc) - timedelta(hours=24)
+
+    fresh_bots = []
+    for b in all_bots:
+        # Skip bots whose meeting started more than 24 hours ago — stale, never process
+        join_at_str = b.get("join_at") or b.get("created_at", "")
+        try:
+            join_at = datetime.fromisoformat(join_at_str.replace("Z", "+00:00"))
+            if join_at < cutoff:
+                print(f"[Poller] Bot {b['id']} is stale (join_at={join_at_str}). Marking processed and skipping.")
+                await mark_processed(b["id"])
+                continue
+        except Exception:
+            pass  # If we can't parse the date, let is_processed decide
+        fresh_bots.append(b)
+
+    new_bots = [b for b in fresh_bots if not await is_processed(b["id"])]
 
     if new_bots:
         print(f"[Poller] Found {len(new_bots)} unprocessed bot(s). Processing...")
