@@ -437,17 +437,38 @@ async def _open_pick_task_modal(trigger_id: str, action_value: dict, response_ur
                     "text": f"*Action Point:*\n{display_text}"
                 }
             },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "1) Pick a parent task\n"
+                        "2) Choose where to post: parent activity or one of its subtasks"
+                    )
+                }
+            },
             {"type": "divider"},
             {
                 "type":     "input",
-                "block_id": "task_select",
+                "block_id": "parent_select",
                 "element": {
                     "type":             "external_select",
-                    "placeholder":      {"type": "plain_text", "text": "Search tasks..."},
-                    "action_id":        "selected_task",
+                    "placeholder":      {"type": "plain_text", "text": "Search parent tasks..."},
+                    "action_id":        "selected_parent",
                     "min_query_length": 0
                 },
-                "label": {"type": "plain_text", "text": "Select a ClickUp Task"}
+                "label": {"type": "plain_text", "text": "Parent Task"}
+            },
+            {
+                "type":     "input",
+                "block_id": "target_select",
+                "element": {
+                    "type":             "external_select",
+                    "placeholder":      {"type": "plain_text", "text": "Pick parent or subtask..."},
+                    "action_id":        "selected_target",
+                    "min_query_length": 0
+                },
+                "label": {"type": "plain_text", "text": "Post Comment To"}
             }
         ]
     }
@@ -714,9 +735,25 @@ async def _handle_modal_submit(payload: dict):
     state            = view.get("state", {}).get("values", {})
     slack_user_id    = payload.get("user", {}).get("id", "")
 
-    selected_opt  = state.get("task_select", {}).get("selected_task", {}).get("selected_option", {})
-    selected_id   = selected_opt.get("value", "")
+    selected_opt_new = state.get("target_select", {}).get("selected_target", {}).get("selected_option", {}) or {}
+    selected_opt_old = state.get("task_select", {}).get("selected_task", {}).get("selected_option", {}) or {}
+
+    selected_opt  = selected_opt_new or selected_opt_old
+    selected_val  = selected_opt.get("value", "")
     selected_name = selected_opt.get("text", {}).get("text", "")
+
+    # New value format:
+    #   p:<parent_id>            -> post on parent
+    #   s:<subtask_id>:<parent>  -> post on subtask
+    # Legacy format:
+    #   <task_id>
+    if isinstance(selected_val, str) and selected_val.startswith("p:"):
+        selected_id = selected_val[2:]
+    elif isinstance(selected_val, str) and selected_val.startswith("s:"):
+        parts = selected_val.split(":")
+        selected_id = parts[1] if len(parts) >= 2 else ""
+    else:
+        selected_id = selected_val
 
     meeting_id   = private_metadata.get("mid", "")
     step_index   = private_metadata.get("si", 0)

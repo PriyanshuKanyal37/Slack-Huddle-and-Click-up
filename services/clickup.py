@@ -435,6 +435,13 @@ async def get_backlog_tasks() -> list[dict]:
         if not batch:
             break
         for t in batch:
+            parent_raw = t.get("parent")
+            if isinstance(parent_raw, dict):
+                parent_id = str(parent_raw.get("id") or "")
+            elif parent_raw:
+                parent_id = str(parent_raw)
+            else:
+                parent_id = ""
             assignees = t.get("assignees", [])
             assignee_names = ", ".join(
                 a.get("username", "").split()[0]   # first name only
@@ -444,7 +451,9 @@ async def get_backlog_tasks() -> list[dict]:
                 "id":        t.get("id"),
                 "name":      t.get("name", ""),
                 "status":    t.get("status", {}).get("status", ""),
-                "assignees": assignee_names
+                "assignees": assignee_names,
+                "parent_id": parent_id,
+                "is_subtask": bool(parent_id)
             })
         if len(batch) < 100:   # ClickUp returns max 100 per page
             break
@@ -480,6 +489,49 @@ def search_backlog_by_query(query: str, all_tasks: list[dict]) -> list[dict]:
     assigned   = [t for t in matched if t.get("assignees")]
     unassigned = [t for t in matched if not t.get("assignees")]
     return (assigned + unassigned)[:100]
+
+
+def get_parent_tasks_for_options(query: str, all_tasks: list[dict]) -> list[dict]:
+    """
+    Return only parent tasks for Slack parent selector.
+    Assigned tasks are ranked first, then unassigned.
+    """
+    q = (query or "").lower().strip()
+    parents = [t for t in all_tasks if not t.get("is_subtask")]
+    if q:
+        parents = [
+            t for t in parents
+            if q in t.get("name", "").lower() or q in t.get("assignees", "").lower()
+        ]
+    assigned = [t for t in parents if t.get("assignees")]
+    unassigned = [t for t in parents if not t.get("assignees")]
+    return (assigned + unassigned)[:100]
+
+
+def get_targets_for_parent(parent_id: str, query: str, all_tasks: list[dict]) -> tuple[dict | None, list[dict]]:
+    """
+    For a selected parent task, return:
+    - parent task object
+    - list of its direct subtasks (optionally filtered by query)
+    """
+    if not parent_id:
+        return None, []
+
+    parent = next((t for t in all_tasks if t.get("id") == parent_id), None)
+    if not parent:
+        return None, []
+
+    q = (query or "").lower().strip()
+    subtasks = [t for t in all_tasks if t.get("parent_id") == parent_id]
+    if q:
+        subtasks = [
+            t for t in subtasks
+            if q in t.get("name", "").lower() or q in t.get("assignees", "").lower()
+        ]
+
+    assigned = [t for t in subtasks if t.get("assignees")]
+    unassigned = [t for t in subtasks if not t.get("assignees")]
+    return parent, (assigned + unassigned)[:100]
 
 
 async def validate_clickup_api_key(api_key: str) -> tuple[bool, str]:
@@ -673,4 +725,3 @@ async def post_task_comment(task_id: str, comment_text: str, api_key: str = None
         )
         r.raise_for_status()
     print(f"[ClickUp] Comment posted to task {task_id}")
-

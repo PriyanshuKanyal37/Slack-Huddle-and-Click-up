@@ -527,21 +527,86 @@ async def slack_options(request: Request):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
 
     form    = await request.form()
-    payload = json.loads(form.get("payload", "{}"))
-    query   = payload.get("value", "").strip()
+    payload    = json.loads(form.get("payload", "{}"))
+    query      = payload.get("value", "").strip()
+    action_id  = payload.get("action_id", "")
+    state_vals = payload.get("view", {}).get("state", {}).get("values", {})
 
-    from services.clickup import get_backlog_tasks_cached, search_backlog_by_query
+    from services.clickup import (
+        get_backlog_tasks_cached,
+        search_backlog_by_query,
+        get_parent_tasks_for_options,
+        get_targets_for_parent,
+    )
 
     all_tasks = await get_backlog_tasks_cached()
 
+    # New flow: parent task selector
+    if action_id == "selected_parent":
+        parent_tasks = get_parent_tasks_for_options(query, all_tasks)
+        print(f"[Slack Options] parent query='{query}' → {len(parent_tasks)} matches")
+        options = []
+        for t in parent_tasks:
+            name      = t.get("name", "")[:75]
+            assignees = t.get("assignees", "")
+            option    = {"text": {"type": "plain_text", "text": name}, "value": f"p:{t['id']}"}
+            if assignees:
+                option["description"] = {"type": "plain_text", "text": assignees[:75]}
+            options.append(option)
+        if not options:
+            options = [{"text": {"type": "plain_text", "text": "No parent tasks found"}, "value": "none"}]
+        return {"options": options}
+
+    # New flow: target selector (parent activity OR one of its subtasks)
+    if action_id == "selected_target":
+        selected_parent_val = (
+            state_vals.get("parent_select", {})
+            .get("selected_parent", {})
+            .get("selected_option", {})
+            .get("value", "")
+        )
+        parent_id = selected_parent_val[2:] if isinstance(selected_parent_val, str) and selected_parent_val.startswith("p:") else selected_parent_val
+        parent_task, subtasks = get_targets_for_parent(parent_id, query, all_tasks)
+        print(f"[Slack Options] target parent='{parent_id}' query='{query}' → {len(subtasks)} subtasks")
+
+        options = []
+        if parent_task:
+            parent_name = parent_task.get("name", "")[:67]
+            options.append({
+                "text": {"type": "plain_text", "text": f"Parent: {parent_name}"},
+                "value": f"p:{parent_task['id']}",
+                "description": {"type": "plain_text", "text": "Post to parent activity"}
+            })
+
+            for st in subtasks:
+                sub_name   = st.get("name", "")[:65]
+                assignees  = st.get("assignees", "")
+                sub_option = {
+                    "text":  {"type": "plain_text", "text": f"Subtask: {sub_name}"},
+                    "value": f"s:{st['id']}:{parent_task['id']}"
+                }
+                if assignees:
+                    sub_option["description"] = {"type": "plain_text", "text": assignees[:75]}
+                options.append(sub_option)
+        else:
+            options = [{
+                "text": {"type": "plain_text", "text": "Select parent task first"},
+                "value": "none"
+            }]
+
+        if not options:
+            options = [{"text": {"type": "plain_text", "text": "No targets found"}, "value": "none"}]
+        return {"options": options[:100]}
+
+    # Legacy flow (backward compatibility for old modal messages)
     if query:
         tasks = search_backlog_by_query(query, all_tasks)
-        print(f"[Slack Options] query='{query}' → {len(tasks)} matches")
+        print(f"[Slack Options] legacy query='{query}' → {len(tasks)} matches")
     else:
         assigned   = [t for t in all_tasks if t.get("assignees")]
         unassigned = [t for t in all_tasks if not t.get("assignees")]
         tasks      = (assigned + unassigned)[:100]
-        print(f"[Slack Options] default load: {len(tasks)} tasks")
+        print(f"[Slack Options] legacy default load: {len(tasks)} tasks")
 
     options = []
     for t in tasks:
@@ -549,7 +614,7 @@ async def slack_options(request: Request):
         assignees = t.get("assignees", "")
         option    = {"text": {"type": "plain_text", "text": name}, "value": t["id"]}
         if assignees:
-            option["description"] = {"type": "plain_text", "text": assignees}
+            option["description"] = {"type": "plain_text", "text": assignees[:75]}
         options.append(option)
 
     if not options:
