@@ -20,6 +20,7 @@ redis_client = Redis(
 )
 
 ACTION_STATE_TTL = 7 * 24 * 60 * 60   # 7 days
+PARENT_PICK_TTL  = 60 * 60            # 1 hour
 
 
 # ── Redis helpers ─────────────────────────────────────────────────────────────
@@ -211,7 +212,9 @@ async def handle_interaction(payload: dict):
         trigger_id    = payload.get("trigger_id", "")
         slack_user_id = payload.get("user", {}).get("id", "")
 
-        if action_id.startswith("confirm_"):
+        if action_id == "selected_parent":
+            await _handle_parent_selected(payload, action)
+        elif action_id.startswith("confirm_"):
             await _handle_confirm(action, response_url, slack_user_id, trigger_id)
         elif action_id.startswith("change_") or action_id.startswith("pick_"):
             await _handle_change_or_pick(action, trigger_id, response_url, slack_user_id)
@@ -341,6 +344,30 @@ async def _handle_edit(action: dict, slack_user_id: str):
         print(f"[Slack Interact] _handle_edit failed: {e}")
 
 
+async def _handle_parent_selected(payload: dict, action: dict):
+    """
+    Persist selected parent value for the current modal view.
+    Slack options requests for the second selector may omit view.state in some payloads,
+    so we keep a short-lived fallback keyed by view_id + user_id.
+    """
+    view_id     = payload.get("view", {}).get("id", "")
+    slack_user  = payload.get("user", {}).get("id", "")
+    parent_val  = (action.get("selected_option", {}) or {}).get("value", "")
+
+    if not view_id or not slack_user or not parent_val:
+        return
+
+    try:
+        await redis_client.set(
+            f"parent_pick:{view_id}:{slack_user}",
+            parent_val,
+            ex=PARENT_PICK_TTL
+        )
+        print(f"[Slack Interact] parent selected cached view={view_id} user={slack_user} val={parent_val}")
+    except Exception as e:
+        print(f"[Slack Interact] Failed to cache parent selection: {e}")
+
+
 # ── Modal openers ─────────────────────────────────────────────────────────────
 
 async def _open_api_key_modal(trigger_id: str, pending_action: str, action_value: dict, response_url: str):
@@ -451,6 +478,7 @@ async def _open_pick_task_modal(trigger_id: str, action_value: dict, response_ur
             {
                 "type":     "input",
                 "block_id": "parent_select",
+                "dispatch_action": True,
                 "element": {
                     "type":             "external_select",
                     "placeholder":      {"type": "plain_text", "text": "Search parent tasks..."},

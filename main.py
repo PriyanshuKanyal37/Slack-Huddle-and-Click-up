@@ -530,7 +530,12 @@ async def slack_options(request: Request):
     payload    = json.loads(form.get("payload", "{}"))
     query      = payload.get("value", "").strip()
     action_id  = payload.get("action_id", "")
-    state_vals = payload.get("view", {}).get("state", {}).get("values", {})
+    # Slack can send state in different shapes for options requests.
+    state_vals = (
+        payload.get("view", {}).get("state", {}).get("values", {}) or
+        payload.get("state", {}).get("values", {}) or
+        {}
+    )
 
     from services.clickup import (
         get_backlog_tasks_cached,
@@ -565,6 +570,36 @@ async def slack_options(request: Request):
             .get("selected_option", {})
             .get("value", "")
         )
+
+        # Fallback: scan all state entries for any selected_option value prefixed with p:
+        if not selected_parent_val:
+            for block_data in state_vals.values():
+                if not isinstance(block_data, dict):
+                    continue
+                for action_data in block_data.values():
+                    if not isinstance(action_data, dict):
+                        continue
+                    candidate = (action_data.get("selected_option", {}) or {}).get("value", "")
+                    if isinstance(candidate, str) and candidate.startswith("p:"):
+                        selected_parent_val = candidate
+                        break
+                if selected_parent_val:
+                    break
+
+        # Final fallback: use value cached from selected_parent block_action.
+        if not selected_parent_val:
+            view_id = payload.get("view", {}).get("id", "")
+            user_id = payload.get("user", {}).get("id", "")
+            if view_id and user_id:
+                try:
+                    cached_val = await redis.get(f"parent_pick:{view_id}:{user_id}")
+                    if isinstance(cached_val, bytes):
+                        cached_val = cached_val.decode("utf-8", errors="ignore")
+                    if cached_val:
+                        selected_parent_val = cached_val
+                except Exception as e:
+                    print(f"[Slack Options] parent cache lookup failed: {e}")
+
         parent_id = selected_parent_val[2:] if isinstance(selected_parent_val, str) and selected_parent_val.startswith("p:") else selected_parent_val
         parent_task, subtasks = get_targets_for_parent(parent_id, query, all_tasks)
         print(f"[Slack Options] target parent='{parent_id}' query='{query}' → {len(subtasks)} subtasks")
