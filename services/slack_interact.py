@@ -470,7 +470,7 @@ async def _open_pick_task_modal(trigger_id: str, action_value: dict, response_ur
                     "type": "mrkdwn",
                     "text": (
                         "1) Pick a parent task\n"
-                        "2) Choose where to post: parent activity or one of its subtasks"
+                        "2) Optional: choose subtask (leave empty to post on parent)"
                     )
                 }
             },
@@ -490,13 +490,14 @@ async def _open_pick_task_modal(trigger_id: str, action_value: dict, response_ur
             {
                 "type":     "input",
                 "block_id": "target_select",
+                "optional": True,
                 "element": {
                     "type":             "external_select",
-                    "placeholder":      {"type": "plain_text", "text": "Pick parent or subtask..."},
+                    "placeholder":      {"type": "plain_text", "text": "Choose subtask (optional)..."},
                     "action_id":        "selected_target",
                     "min_query_length": 0
                 },
-                "label": {"type": "plain_text", "text": "Post Comment To"}
+                "label": {"type": "plain_text", "text": "Choose Subtask (Optional)"}
             }
         ]
     }
@@ -764,9 +765,10 @@ async def _handle_modal_submit(payload: dict):
     slack_user_id    = payload.get("user", {}).get("id", "")
 
     selected_opt_new = state.get("target_select", {}).get("selected_target", {}).get("selected_option", {}) or {}
+    selected_opt_parent = state.get("parent_select", {}).get("selected_parent", {}).get("selected_option", {}) or {}
     selected_opt_old = state.get("task_select", {}).get("selected_task", {}).get("selected_option", {}) or {}
 
-    selected_opt  = selected_opt_new or selected_opt_old
+    selected_opt  = selected_opt_new or selected_opt_parent or selected_opt_old
     selected_val  = selected_opt.get("value", "")
     selected_name = selected_opt.get("text", {}).get("text", "")
 
