@@ -428,7 +428,7 @@ async def get_backlog_tasks() -> list[dict]:
             r = await client.get(
                 f"{BASE_URL}/list/{CLICKUP_BACKLOG_LIST_ID}/task",
                 headers=HEADERS,
-                params={"include_closed": "false", "page": page}
+                params={"include_closed": "false", "subtasks": "true", "page": page}
             )
             r.raise_for_status()
         batch = r.json().get("tasks", [])
