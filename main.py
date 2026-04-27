@@ -563,13 +563,31 @@ async def slack_options(request: Request):
         return {"options": options}
 
     # New flow: target selector (parent activity OR one of its subtasks)
-    if action_id == "selected_target":
+    if action_id.startswith("selected_target"):
+        action_parent_id = ""
+        if "__" in action_id:
+            action_parent_id = action_id.split("__", 1)[1].strip()
+
         selected_parent_val = (
             state_vals.get("parent_select", {})
             .get("selected_parent", {})
             .get("selected_option", {})
             .get("value", "")
         )
+
+        # Strongest source: action_id carries current parent id after modal refresh.
+        if action_parent_id:
+            selected_parent_val = f"p:{action_parent_id}"
+
+        # Fallback from modal private metadata if present.
+        if not selected_parent_val:
+            try:
+                private_meta_raw = payload.get("view", {}).get("private_metadata", "{}")
+                private_meta = json.loads(private_meta_raw) if private_meta_raw else {}
+                if isinstance(private_meta, dict):
+                    selected_parent_val = private_meta.get("selected_parent_value", "") or ""
+            except Exception:
+                pass
 
         # Fallback: scan all state entries for any selected_option value prefixed with p:
         if not selected_parent_val:
@@ -678,6 +696,15 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks):
     # Slack url_verification (shouldn't hit this route but handle just in case)
     if interaction_type == "url_verification":
         return {"challenge": payload.get("challenge")}
+
+    # selected_parent must be processed synchronously so target dropdown reads latest parent
+    # (avoids race where slack-options fires before background task updates Redis cache).
+    if interaction_type == "block_actions":
+        actions = payload.get("actions", []) or []
+        first_action_id = (actions[0].get("action_id", "") if actions else "")
+        if first_action_id == "selected_parent":
+            await handle_interaction(payload)
+            return {"status": "ok"}
 
     # Process in background — return 200 immediately to Slack
     background_tasks.add_task(handle_interaction, payload)

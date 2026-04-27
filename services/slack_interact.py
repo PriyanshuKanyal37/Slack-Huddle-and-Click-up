@@ -350,9 +350,13 @@ async def _handle_parent_selected(payload: dict, action: dict):
     Slack options requests for the second selector may omit view.state in some payloads,
     so we keep a short-lived fallback keyed by view_id + user_id.
     """
-    view_id     = payload.get("view", {}).get("id", "")
+    view_obj    = payload.get("view", {}) or {}
+    view_id     = view_obj.get("id", "")
+    view_hash   = view_obj.get("hash", "")
     slack_user  = payload.get("user", {}).get("id", "")
-    parent_val  = (action.get("selected_option", {}) or {}).get("value", "")
+    selected_opt = action.get("selected_option", {}) or {}
+    parent_val   = selected_opt.get("value", "")
+    parent_text  = (selected_opt.get("text", {}) or {}).get("text", "")
 
     if not view_id or not slack_user or not parent_val:
         return
@@ -366,6 +370,38 @@ async def _handle_parent_selected(payload: dict, action: dict):
         print(f"[Slack Interact] parent selected cached view={view_id} user={slack_user} val={parent_val}")
     except Exception as e:
         print(f"[Slack Interact] Failed to cache parent selection: {e}")
+
+    # Rebuild modal with a new target selector identity tied to parent ID.
+    # This forces Slack to fetch fresh options and avoids stale subtask lists.
+    try:
+        private_metadata = json.loads(view_obj.get("private_metadata", "{}"))
+        private_metadata["selected_parent_value"] = parent_val
+        if parent_text:
+            private_metadata["selected_parent_text"] = parent_text
+
+        display_text = private_metadata.get("display_text", "(see meeting notes)")
+        updated_view = _build_pick_task_modal_view(
+            private_metadata=private_metadata,
+            display_text=display_text,
+            selected_parent_value=parent_val,
+            selected_parent_text=parent_text
+        )
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                "https://slack.com/api/views.update",
+                headers=HEADERS,
+                json={
+                    "view_id": view_id,
+                    "hash": view_hash,
+                    "view": updated_view
+                }
+            )
+        resp = r.json()
+        if not resp.get("ok"):
+            print(f"[Slack Interact] views.update failed after parent select: {resp.get('error')}")
+    except Exception as e:
+        print(f"[Slack Interact] Failed to refresh modal after parent select: {e}")
 
 
 # ── Modal openers ─────────────────────────────────────────────────────────────
@@ -444,18 +480,61 @@ async def _open_pick_task_modal(trigger_id: str, action_value: dict, response_ur
         step_data    = await _get_step_data(meeting_id, step_index)
         display_text = step_data["task_text"] if step_data else "(see meeting notes)"
 
-    private_metadata = json.dumps({
+    private_metadata = {
         **action_value,
-        "response_url": response_url
-    })
+        "response_url": response_url,
+        "display_text": display_text
+    }
+    modal = _build_pick_task_modal_view(private_metadata=private_metadata, display_text=display_text)
 
-    modal = {
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            "https://slack.com/api/views.open",
+            headers=HEADERS,
+            json={"trigger_id": trigger_id, "view": modal}
+        )
+    resp = r.json()
+    if not resp.get("ok"):
+        print(f"[Slack Interact] pick modal views.open failed: {resp.get('error')}")
+
+
+def _build_pick_task_modal_view(
+    private_metadata: dict,
+    display_text: str,
+    selected_parent_value: str = "",
+    selected_parent_text: str = ""
+) -> dict:
+    """
+    Build pick-task modal view.
+    target_select/action ids are versioned by parent id to force Slack to refetch
+    external_select options after parent changes.
+    """
+    parent_id = ""
+    if isinstance(selected_parent_value, str) and selected_parent_value.startswith("p:"):
+        parent_id = selected_parent_value[2:]
+
+    target_block_id = f"target_select_{parent_id}" if parent_id else "target_select"
+    target_action_id = f"selected_target__{parent_id}" if parent_id else "selected_target"
+
+    parent_element = {
+        "type":             "external_select",
+        "placeholder":      {"type": "plain_text", "text": "Search parent tasks..."},
+        "action_id":        "selected_parent",
+        "min_query_length": 0
+    }
+    if selected_parent_value and selected_parent_text:
+        parent_element["initial_option"] = {
+            "text": {"type": "plain_text", "text": selected_parent_text[:75]},
+            "value": selected_parent_value
+        }
+
+    return {
         "type":             "modal",
         "callback_id":      "pick_task_modal",
         "title":            {"type": "plain_text", "text": "Pick a Task"},
         "submit":           {"type": "plain_text", "text": "Post Comment"},
         "close":            {"type": "plain_text", "text": "Cancel"},
-        "private_metadata": private_metadata,
+        "private_metadata": json.dumps(private_metadata),
         "blocks": [
             {
                 "type": "section",
@@ -479,38 +558,23 @@ async def _open_pick_task_modal(trigger_id: str, action_value: dict, response_ur
                 "type":     "input",
                 "block_id": "parent_select",
                 "dispatch_action": True,
-                "element": {
-                    "type":             "external_select",
-                    "placeholder":      {"type": "plain_text", "text": "Search parent tasks..."},
-                    "action_id":        "selected_parent",
-                    "min_query_length": 0
-                },
+                "element": parent_element,
                 "label": {"type": "plain_text", "text": "Parent Task"}
             },
             {
                 "type":     "input",
-                "block_id": "target_select",
+                "block_id": target_block_id,
                 "optional": True,
                 "element": {
                     "type":             "external_select",
                     "placeholder":      {"type": "plain_text", "text": "Choose subtask (optional)..."},
-                    "action_id":        "selected_target",
+                    "action_id":        target_action_id,
                     "min_query_length": 0
                 },
                 "label": {"type": "plain_text", "text": "Choose Subtask (Optional)"}
             }
         ]
     }
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(
-            "https://slack.com/api/views.open",
-            headers=HEADERS,
-            json={"trigger_id": trigger_id, "view": modal}
-        )
-    resp = r.json()
-    if not resp.get("ok"):
-        print(f"[Slack Interact] pick modal views.open failed: {resp.get('error')}")
 
 
 async def _open_create_task_modal(trigger_id: str, action_value: dict, response_url: str):
@@ -764,7 +828,22 @@ async def _handle_modal_submit(payload: dict):
     state            = view.get("state", {}).get("values", {})
     slack_user_id    = payload.get("user", {}).get("id", "")
 
-    selected_opt_new = state.get("target_select", {}).get("selected_target", {}).get("selected_option", {}) or {}
+    selected_opt_new = {}
+    for block_id, actions in state.items():
+        if not (isinstance(block_id, str) and block_id.startswith("target_select")):
+            continue
+        if not isinstance(actions, dict):
+            continue
+        for action_data in actions.values():
+            if not isinstance(action_data, dict):
+                continue
+            opt = (action_data.get("selected_option", {}) or {})
+            if opt:
+                selected_opt_new = opt
+                break
+        if selected_opt_new:
+            break
+
     selected_opt_parent = state.get("parent_select", {}).get("selected_parent", {}).get("selected_option", {}) or {}
     selected_opt_old = state.get("task_select", {}).get("selected_task", {}).get("selected_option", {}) or {}
 
