@@ -21,7 +21,69 @@ _sarvam_key_index = 0   # tracks which key is currently active
 SARVAM_URL = "https://api.sarvam.ai/speech-to-text-translate"
 
 CHUNK_SECONDS = 25   # Sarvam AI limit is 30s, use 25s to be safe
-MAX_RETRIES = 5      # max retries on 429 rate limit
+MAX_RETRIES = 8      # max retries on 429 rate limit
+MIN_REQUEST_INTERVAL_SECONDS = float(os.getenv("SARVAM_MIN_REQUEST_INTERVAL_SECONDS", "4"))
+EXHAUSTED_LOG_INTERVAL_SECONDS = int(os.getenv("SARVAM_EXHAUSTED_LOG_INTERVAL_SECONDS", "60"))
+
+_sarvam_request_lock = asyncio.Lock()
+_last_sarvam_request_at = 0.0
+_sarvam_all_keys_exhausted = False
+_sarvam_exhaustion_logger_task: asyncio.Task | None = None
+
+
+async def _log_sarvam_exhaustion_until_recovered():
+    while _sarvam_all_keys_exhausted:
+        print(
+            "[Sarvam] ALL API KEY CREDITS EXHAUSTED. "
+            "Add credits or configure another SARVAM_API_KEY. "
+            f"Configured keys: {len(SARVAM_KEYS)}"
+        )
+        await asyncio.sleep(EXHAUSTED_LOG_INTERVAL_SECONDS)
+
+
+def _start_sarvam_exhaustion_logger():
+    global _sarvam_all_keys_exhausted, _sarvam_exhaustion_logger_task
+    _sarvam_all_keys_exhausted = True
+    if _sarvam_exhaustion_logger_task and not _sarvam_exhaustion_logger_task.done():
+        return
+    _sarvam_exhaustion_logger_task = asyncio.create_task(_log_sarvam_exhaustion_until_recovered())
+
+
+def _clear_sarvam_exhaustion_logger():
+    global _sarvam_all_keys_exhausted, _sarvam_exhaustion_logger_task
+    if not _sarvam_all_keys_exhausted:
+        return
+    _sarvam_all_keys_exhausted = False
+    if _sarvam_exhaustion_logger_task and not _sarvam_exhaustion_logger_task.done():
+        _sarvam_exhaustion_logger_task.cancel()
+    _sarvam_exhaustion_logger_task = None
+    print("[Sarvam] API key credits available again. Continuing transcription.")
+
+
+def _retry_after_seconds(response: httpx.Response, attempt: int) -> float:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return max(float(retry_after), MIN_REQUEST_INTERVAL_SECONDS)
+        except ValueError:
+            pass
+    return min(15 * (2 ** (attempt - 1)), 300)
+
+
+async def _post_to_sarvam(headers: dict, files: dict, data: dict) -> httpx.Response:
+    global _last_sarvam_request_at
+    async with _sarvam_request_lock:
+        now = asyncio.get_running_loop().time()
+        wait = MIN_REQUEST_INTERVAL_SECONDS - (now - _last_sarvam_request_at)
+        if wait > 0:
+            await asyncio.sleep(wait)
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                SARVAM_URL, headers=headers, files=files, data=data
+            )
+        _last_sarvam_request_at = asyncio.get_running_loop().time()
+        return response
 
 
 def _extract_chunks_sync(media_path: str) -> list[str]:
@@ -89,6 +151,9 @@ async def transcribe_audio(media_path: str) -> str:
     """
     loop = asyncio.get_event_loop()
 
+    if not SARVAM_KEYS:
+        raise Exception("[Sarvam] No API keys configured. Set SARVAM_API_KEY or SARVAM_API_KEY_1..3.")
+
     # Run blocking ffmpeg in thread pool — won't freeze the server
     chunk_paths = await loop.run_in_executor(None, _extract_chunks_sync, media_path)
     print(f"[Sarvam] Split into {len(chunk_paths)} chunks")
@@ -113,23 +178,29 @@ async def transcribe_audio(media_path: str) -> str:
 
             global _sarvam_key_index
             for attempt in range(1, MAX_RETRIES + 1):
-                headers = {"api-subscription-key": SARVAM_KEYS[_sarvam_key_index]}
-                async with httpx.AsyncClient(timeout=60) as client:
-                    response = await client.post(
-                        SARVAM_URL, headers=headers, files=files, data=data
-                    )
+                exhausted_keys_this_attempt = 0
+                while exhausted_keys_this_attempt < len(SARVAM_KEYS):
+                    key_slot = _sarvam_key_index + 1
+                    headers = {"api-subscription-key": SARVAM_KEYS[_sarvam_key_index]}
+                    response = await _post_to_sarvam(headers, files, data)
 
-                # Credits exhausted — switch to next key and retry immediately
-                if response.status_code == 402:
-                    if _sarvam_key_index + 1 < len(SARVAM_KEYS):
-                        _sarvam_key_index += 1
-                        print(f"[Sarvam] Key exhausted. Switching to key {_sarvam_key_index + 1}/{len(SARVAM_KEYS)}...")
-                        continue
-                    else:
-                        raise Exception("[Sarvam] All API keys exhausted. Add more credits.")
+                    # Credits exhausted — switch to next configured key and retry immediately.
+                    if response.status_code != 402:
+                        _clear_sarvam_exhaustion_logger()
+                        break
+
+                    exhausted_keys_this_attempt += 1
+                    print(f"[Sarvam] API key {key_slot}/{len(SARVAM_KEYS)} credits exhausted.")
+                    _sarvam_key_index = (_sarvam_key_index + 1) % len(SARVAM_KEYS)
+                    if exhausted_keys_this_attempt < len(SARVAM_KEYS):
+                        print(f"[Sarvam] Switching to API key {_sarvam_key_index + 1}/{len(SARVAM_KEYS)}...")
+
+                else:
+                    _start_sarvam_exhaustion_logger()
+                    raise Exception("[Sarvam] ALL API KEY CREDITS EXHAUSTED. Add credits or configure another SARVAM_API_KEY.")
 
                 if response.status_code == 429:
-                    wait = int(response.headers.get("Retry-After", 2 ** attempt))
+                    wait = _retry_after_seconds(response, attempt)
                     print(f"[Sarvam] Rate limited on chunk {i+1}. Waiting {wait}s (attempt {attempt}/{MAX_RETRIES})...")
                     await asyncio.sleep(wait)
                     continue
