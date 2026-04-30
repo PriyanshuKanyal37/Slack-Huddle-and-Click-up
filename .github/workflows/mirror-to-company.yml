@@ -1,0 +1,35 @@
+name: Mirror to company repo
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "*"
+  workflow_dispatch:
+
+concurrency:
+  group: mirror-to-company
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.repository == 'PriyanshuKanyal37/Slack-Huddle-and-Click-up'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Push main and tags to company repo
+        env:
+          COMPANY_REPO_TOKEN: ${{ secrets.COMPANY_REPO_TOKEN }}
+        run: |
+          git config --global --unset-all http.https://github.com/.extraheader || true
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git remote add company "https://x-access-token:${COMPANY_REPO_TOKEN}@github.com/digitalmasterykit-rgb/Slack-Huddle-and-Click-up.git"
+          git push company main --force
+          git push company --tags --force
