@@ -649,6 +649,7 @@ def _build_pick_task_modal_view(
             {
                 "type":     "input",
                 "block_id": target_block_id,
+                "dispatch_action": True,
                 "optional": True,
                 "element": target_element,
                 "label": {"type": "plain_text", "text": "Target Task"}
