@@ -632,9 +632,11 @@ async def slack_options(request: Request):
                 "description": {"type": "plain_text", "text": "Post to parent activity"}
             })
 
+            seen_subtask_ids = set()
             for st in subtasks:
                 sub_name   = st.get("name", "")[:65]
                 assignees  = st.get("assignees", "")
+                seen_subtask_ids.add(str(st.get("id")))
                 sub_option = {
                     "text":  {"type": "plain_text", "text": f"Subtask: {sub_name}"},
                     "value": f"s:{st['id']}:{parent_task['id']}"
@@ -642,6 +644,24 @@ async def slack_options(request: Request):
                 if assignees:
                     sub_option["description"] = {"type": "plain_text", "text": assignees[:75]}
                 options.append(sub_option)
+
+            if query:
+                global_subtasks = search_subtasks_global(query, all_tasks)
+                global_subtasks = [
+                    st for st in global_subtasks
+                    if str(st.get("id")) not in seen_subtask_ids
+                ]
+                print(f"[Slack Options] global subtask query='{query}' with parent='{parent_id}' -> {len(global_subtasks)} extra matches")
+                for st in global_subtasks:
+                    sub_name = st.get("name", "")[:65]
+                    parent_name_for_desc = st.get("parent_name", "")
+                    parent_id_for_value = st.get("parent_id", "")
+                    description = f"Parent: {parent_name_for_desc}" if parent_name_for_desc else "Parent not found in cache"
+                    options.append({
+                        "text": {"type": "plain_text", "text": f"Subtask: {sub_name}"},
+                        "value": f"s:{st['id']}:{parent_id_for_value}",
+                        "description": {"type": "plain_text", "text": description[:75]}
+                    })
         elif query:
             global_subtasks = search_subtasks_global(query, all_tasks)
             print(f"[Slack Options] global subtask query='{query}' -> {len(global_subtasks)} matches")
