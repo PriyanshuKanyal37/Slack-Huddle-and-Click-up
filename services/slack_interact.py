@@ -214,6 +214,8 @@ async def handle_interaction(payload: dict):
 
         if action_id == "selected_parent":
             await _handle_parent_selected(payload, action)
+        elif action_id.startswith("selected_target"):
+            await _handle_target_selected(payload, action)
         elif action_id.startswith("confirm_"):
             await _handle_confirm(action, response_url, slack_user_id, trigger_id)
         elif action_id.startswith("change_") or action_id.startswith("pick_"):
@@ -378,6 +380,8 @@ async def _handle_parent_selected(payload: dict, action: dict):
         private_metadata["selected_parent_value"] = parent_val
         if parent_text:
             private_metadata["selected_parent_text"] = parent_text
+        private_metadata.pop("selected_target_value", None)
+        private_metadata.pop("selected_target_text", None)
 
         display_text = private_metadata.get("display_text", "(see meeting notes)")
         updated_view = _build_pick_task_modal_view(
@@ -402,6 +406,73 @@ async def _handle_parent_selected(payload: dict, action: dict):
             print(f"[Slack Interact] views.update failed after parent select: {resp.get('error')}")
     except Exception as e:
         print(f"[Slack Interact] Failed to refresh modal after parent select: {e}")
+
+
+async def _handle_target_selected(payload: dict, action: dict):
+    """
+    Auto-fill Parent Task when a subtask is selected directly from global search.
+    """
+    view_obj = payload.get("view", {}) or {}
+    view_id = view_obj.get("id", "")
+    view_hash = view_obj.get("hash", "")
+    selected_opt = action.get("selected_option", {}) or {}
+    target_val = selected_opt.get("value", "")
+    target_text = (selected_opt.get("text", {}) or {}).get("text", "")
+
+    if not view_id or not isinstance(target_val, str) or not target_val.startswith("s:"):
+        return
+
+    parts = target_val.split(":")
+    if len(parts) < 3 or not parts[2]:
+        return
+
+    parent_id = parts[2]
+
+    try:
+        private_metadata = json.loads(view_obj.get("private_metadata", "{}"))
+        selected_parent_value = f"p:{parent_id}"
+
+        if (
+            private_metadata.get("selected_parent_value", "") == selected_parent_value
+            and private_metadata.get("selected_target_value", "") == target_val
+        ):
+            return
+
+        from services.clickup import get_backlog_tasks_cached
+        all_tasks = await get_backlog_tasks_cached()
+        parent = next((t for t in all_tasks if str(t.get("id")) == parent_id), None)
+        parent_text = parent.get("name", "") if parent else "Selected parent"
+
+        private_metadata["selected_parent_value"] = selected_parent_value
+        private_metadata["selected_parent_text"] = parent_text
+        private_metadata["selected_target_value"] = target_val
+        private_metadata["selected_target_text"] = target_text
+
+        display_text = private_metadata.get("display_text", "(see meeting notes)")
+        updated_view = _build_pick_task_modal_view(
+            private_metadata=private_metadata,
+            display_text=display_text,
+            selected_parent_value=selected_parent_value,
+            selected_parent_text=parent_text,
+            selected_target_value=target_val,
+            selected_target_text=target_text
+        )
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                "https://slack.com/api/views.update",
+                headers=HEADERS,
+                json={
+                    "view_id": view_id,
+                    "hash": view_hash,
+                    "view": updated_view
+                }
+            )
+        resp = r.json()
+        if not resp.get("ok"):
+            print(f"[Slack Interact] views.update failed after target select: {resp.get('error')}")
+    except Exception as e:
+        print(f"[Slack Interact] Failed to refresh modal after target select: {e}")
 
 
 # ── Modal openers ─────────────────────────────────────────────────────────────
@@ -502,7 +573,9 @@ def _build_pick_task_modal_view(
     private_metadata: dict,
     display_text: str,
     selected_parent_value: str = "",
-    selected_parent_text: str = ""
+    selected_parent_text: str = "",
+    selected_target_value: str = "",
+    selected_target_text: str = ""
 ) -> dict:
     """
     Build pick-task modal view.
@@ -528,6 +601,18 @@ def _build_pick_task_modal_view(
             "value": selected_parent_value
         }
 
+    target_element = {
+        "type":             "external_select",
+        "placeholder":      {"type": "plain_text", "text": "Search subtask or target..."},
+        "action_id":        target_action_id,
+        "min_query_length": 0
+    }
+    if selected_target_value and selected_target_text:
+        target_element["initial_option"] = {
+            "text": {"type": "plain_text", "text": selected_target_text[:75]},
+            "value": selected_target_value
+        }
+
     return {
         "type":             "modal",
         "callback_id":      "pick_task_modal",
@@ -548,8 +633,8 @@ def _build_pick_task_modal_view(
                 "text": {
                     "type": "mrkdwn",
                     "text": (
-                        "1) Pick a parent task, or search subtask directly below\n"
-                        "2) Choose subtask, or leave empty to post on selected parent"
+                        "Pick a parent first, or search a subtask directly.\n"
+                        "Leave target empty only if posting to selected parent."
                     )
                 }
             },
@@ -565,13 +650,8 @@ def _build_pick_task_modal_view(
                 "type":     "input",
                 "block_id": target_block_id,
                 "optional": True,
-                "element": {
-                    "type":             "external_select",
-                    "placeholder":      {"type": "plain_text", "text": "Choose subtask (optional)..."},
-                    "action_id":        target_action_id,
-                    "min_query_length": 0
-                },
-                "label": {"type": "plain_text", "text": "Choose Subtask (Optional)"}
+                "element": target_element,
+                "label": {"type": "plain_text", "text": "Target Task"}
             }
         ]
     }

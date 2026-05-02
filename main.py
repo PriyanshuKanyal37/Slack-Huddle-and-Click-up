@@ -711,12 +711,12 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks):
     if interaction_type == "url_verification":
         return {"challenge": payload.get("challenge")}
 
-    # selected_parent must be processed synchronously so target dropdown reads latest parent
-    # (avoids race where slack-options fires before background task updates Redis cache).
+    # Modal select changes must be processed synchronously so Slack sees the
+    # refreshed view before the user continues inside the same modal.
     if interaction_type == "block_actions":
         actions = payload.get("actions", []) or []
         first_action_id = (actions[0].get("action_id", "") if actions else "")
-        if first_action_id == "selected_parent":
+        if first_action_id == "selected_parent" or first_action_id.startswith("selected_target"):
             await handle_interaction(payload)
             return {"status": "ok"}
 
