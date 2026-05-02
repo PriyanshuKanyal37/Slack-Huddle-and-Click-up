@@ -542,6 +542,7 @@ async def slack_options(request: Request):
         search_backlog_by_query,
         get_parent_tasks_for_options,
         get_targets_for_parent,
+        search_subtasks_global,
     )
 
     all_tasks = await get_backlog_tasks_cached()
@@ -641,9 +642,22 @@ async def slack_options(request: Request):
                 if assignees:
                     sub_option["description"] = {"type": "plain_text", "text": assignees[:75]}
                 options.append(sub_option)
+        elif query:
+            global_subtasks = search_subtasks_global(query, all_tasks)
+            print(f"[Slack Options] global subtask query='{query}' -> {len(global_subtasks)} matches")
+            for st in global_subtasks:
+                sub_name = st.get("name", "")[:65]
+                parent_name = st.get("parent_name", "")
+                parent_id_for_value = st.get("parent_id", "")
+                description = f"Parent: {parent_name}" if parent_name else "Parent not found in cache"
+                options.append({
+                    "text": {"type": "plain_text", "text": f"Subtask: {sub_name}"},
+                    "value": f"s:{st['id']}:{parent_id_for_value}",
+                    "description": {"type": "plain_text", "text": description[:75]}
+                })
         else:
             options = [{
-                "text": {"type": "plain_text", "text": "Select parent task first"},
+                "text": {"type": "plain_text", "text": "Pick parent task or search subtask"},
                 "value": "none"
             }]
 

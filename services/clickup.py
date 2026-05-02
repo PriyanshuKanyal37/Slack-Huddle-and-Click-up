@@ -534,6 +534,37 @@ def get_targets_for_parent(parent_id: str, query: str, all_tasks: list[dict]) ->
     return parent, (assigned + unassigned)[:100]
 
 
+def search_subtasks_global(query: str, all_tasks: list[dict]) -> list[dict]:
+    """
+    Search all subtasks when the user knows the subtask name but not the parent.
+    Returns subtask records with parent metadata used by Slack option rendering.
+    """
+    q = (query or "").lower().strip()
+    if not q:
+        return []
+
+    tasks_by_id = {str(t.get("id")): t for t in all_tasks if t.get("id")}
+    matches = []
+
+    for task in all_tasks:
+        if not task.get("is_subtask"):
+            continue
+        if q not in task.get("name", "").lower() and q not in task.get("assignees", "").lower():
+            continue
+
+        parent_id = str(task.get("parent_id") or "")
+        parent = tasks_by_id.get(parent_id)
+        matches.append({
+            **task,
+            "parent_name": parent.get("name", "") if parent else "",
+            "parent_assignees": parent.get("assignees", "") if parent else "",
+        })
+
+    assigned = [t for t in matches if t.get("assignees")]
+    unassigned = [t for t in matches if not t.get("assignees")]
+    return (assigned + unassigned)[:100]
+
+
 async def validate_clickup_api_key(api_key: str) -> tuple[bool, str]:
     """
     Validates a ClickUp API key by calling GET /user.

@@ -548,8 +548,8 @@ def _build_pick_task_modal_view(
                 "text": {
                     "type": "mrkdwn",
                     "text": (
-                        "1) Pick a parent task\n"
-                        "2) Optional: choose subtask (leave empty to post on parent)"
+                        "1) Pick a parent task, or search subtask directly below\n"
+                        "2) Choose subtask, or leave empty to post on selected parent"
                     )
                 }
             },
