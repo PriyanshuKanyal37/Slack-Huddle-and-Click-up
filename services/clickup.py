@@ -1,10 +1,17 @@
 import httpx
 import os
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+from upstash_redis.asyncio import Redis
 
 load_dotenv()
+
+_redis = Redis(
+    url=os.getenv("UPSTASH_REDIS_URL"),
+    token=os.getenv("UPSTASH_REDIS_TOKEN")
+)
 
 CLICKUP_API_KEY       = os.getenv("CLICKUP_API_KEY")
 CLICKUP_LIST_ID       = os.getenv("CLICKUP_LIST_ID")        # Huddle Meetings list — where notes are posted
@@ -281,8 +288,21 @@ async def create_meeting_task(notes: dict, metadata: dict):
     - start_date + custom Date field = meeting start time
     - assignees = all matched participants
     - Full structured description
-    - One [TOPIC] subtask per topic
+    - Checklist per topic (not subtasks — won't pollute All Tasks)
     """
+    meeting_id = metadata.get("meeting_id", "")
+
+    # Never create duplicate — check if this meeting already has a task
+    if meeting_id:
+        try:
+            existing = await _redis.get(f"meeting_task:{meeting_id}")
+            if existing:
+                existing_id = existing.decode() if isinstance(existing, bytes) else existing
+                print(f"[ClickUp] Meeting {meeting_id} already has task {existing_id}. Skipping creation.")
+                return
+        except Exception as e:
+            print(f"[ClickUp] Redis lookup failed for meeting_task:{meeting_id}: {e} — proceeding")
+
     # Load members if not cached
     await _load_members()
 
@@ -328,28 +348,74 @@ async def create_meeting_task(notes: dict, metadata: dict):
         )
         response.raise_for_status()
 
-    task_id = response.json()["id"]
+    result    = response.json()
+    task_id   = result["id"]
     print(f"[ClickUp] Task created: '{task_name}' (id: {task_id})")
     print(f"[ClickUp] Assigned: {matched_ids} | Unmatched: {unmatched}")
 
-    # One subtask per topic (no assignees, no [TOPIC] prefix)
-    for topic in notes.get("topics", []):
-        detail = topic.get("detail", "")
-        if isinstance(detail, list):
-            detail = "\n".join(detail)
-        subtask_payload = {
-            "name": topic.get("title", "Discussion point"),
-            "markdown_description": detail,
-            "parent": task_id
-        }
+    # Determine prefix from list (HM for Huddle, FM for Fathom)
+    list_prefixes = {
+        "901711952968": "HM",   # Huddle Meetings
+        "901713146576": "FM",   # Fathom Meeting
+    }
+    prefix = list_prefixes.get(CLICKUP_LIST_ID, "MTG")
+
+    # Get next sequence number from Redis
+    seq_key = f"seq:{prefix}"
+    seq = 1
+    try:
+        seq = await _redis.incr(seq_key)
+    except Exception as e:
+        print(f"[ClickUp] Redis incr failed for {seq_key}: {e} — using fallback")
+        seq = str(uuid.uuid4())[:8]
+
+    task_ref = f"{prefix}-{seq}"
+
+    # Rename task with ref prefix
+    new_name = f"{task_ref} — {task_name}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        rename_resp = await client.put(
+            f"{BASE_URL}/task/{task_id}",
+            json={"name": new_name},
+            headers=HEADERS
+        )
+        rename_resp.raise_for_status()
+    print(f"[ClickUp] Renamed: '{new_name}'")
+
+    # Build ID prefix for checklist items (e.g. "HM-5" → items numbered HM-5.1, HM-5.2...)
+    id_prefix = f"{task_ref}."
+
+    # Checklist per topic (doesn't appear in All Tasks / Board views)
+    topics = notes.get("topics", [])
+    if topics:
         async with httpx.AsyncClient(timeout=30) as client:
-            sub = await client.post(
-                f"{BASE_URL}/list/{CLICKUP_LIST_ID}/task",
-                json=subtask_payload,
+            cl = await client.post(
+                f"{BASE_URL}/task/{task_id}/checklist",
+                json={"name": "Topics Discussed"},
                 headers=HEADERS
             )
-            sub.raise_for_status()
-        print(f"[ClickUp] Subtask: {topic.get('title')}")
+            cl.raise_for_status()
+        checklist_id = cl.json()["checklist"]["id"]
+
+        for i, topic in enumerate(topics, 1):
+            title = topic.get("title", "Discussion point")
+            name  = f"{id_prefix}{i} — {title}" if id_prefix else f"{i}. {title}"
+            async with httpx.AsyncClient(timeout=30) as client:
+                ci_resp = await client.post(
+                    f"{BASE_URL}/checklist/{checklist_id}/checklist_item",
+                    json={"name": name, "orderindex": i - 1},
+                    headers=HEADERS
+                )
+                ci_resp.raise_for_status()
+            print(f"[ClickUp] Checklist item: {name}")
+
+    # Persist mapping so custom task ID never duplicates even after Redis expiry
+    if meeting_id:
+        try:
+            await _redis.set(f"meeting_task:{meeting_id}", task_id, ex=365 * 24 * 60 * 60)
+            print(f"[ClickUp] Stored mapping meeting_task:{meeting_id} -> {task_id}")
+        except Exception as e:
+            print(f"[ClickUp] Failed to store meeting_task mapping: {e} — task created, mapping skipped")
 
 
 async def search_relevant_tasks(keywords: list[str]) -> list[dict]:
