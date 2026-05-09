@@ -22,7 +22,7 @@ SARVAM_URL = "https://api.sarvam.ai/speech-to-text-translate"
 
 CHUNK_SECONDS = 25   # Sarvam AI limit is 30s, use 25s to be safe
 MAX_RETRIES = 8      # max retries on 429 rate limit
-MIN_REQUEST_INTERVAL_SECONDS = float(os.getenv("SARVAM_MIN_REQUEST_INTERVAL_SECONDS", "4"))
+MIN_REQUEST_INTERVAL_SECONDS = float(os.getenv("SARVAM_MIN_REQUEST_INTERVAL_SECONDS", "8"))
 EXHAUSTED_LOG_INTERVAL_SECONDS = int(os.getenv("SARVAM_EXHAUSTED_LOG_INTERVAL_SECONDS", "60"))
 
 _sarvam_request_lock = asyncio.Lock()
@@ -178,30 +178,44 @@ async def transcribe_audio(media_path: str) -> str:
 
             global _sarvam_key_index
             for attempt in range(1, MAX_RETRIES + 1):
-                exhausted_keys_this_attempt = 0
-                while exhausted_keys_this_attempt < len(SARVAM_KEYS):
+                keys_tried = 0
+                exhausted_count = 0
+                response = None
+                while keys_tried < len(SARVAM_KEYS):
                     key_slot = _sarvam_key_index + 1
                     headers = {"api-subscription-key": SARVAM_KEYS[_sarvam_key_index]}
                     response = await _post_to_sarvam(headers, files, data)
+                    keys_tried += 1
 
-                    # Credits exhausted — switch to next configured key and retry immediately.
-                    if response.status_code != 402:
-                        _clear_sarvam_exhaustion_logger()
-                        break
+                    # Credits exhausted on this key — rotate to next.
+                    if response.status_code == 402:
+                        exhausted_count += 1
+                        print(f"[Sarvam] API key {key_slot}/{len(SARVAM_KEYS)} credits exhausted.")
+                        _sarvam_key_index = (_sarvam_key_index + 1) % len(SARVAM_KEYS)
+                        if keys_tried < len(SARVAM_KEYS):
+                            print(f"[Sarvam] Switching to API key {_sarvam_key_index + 1}/{len(SARVAM_KEYS)}...")
+                        continue
 
-                    exhausted_keys_this_attempt += 1
-                    print(f"[Sarvam] API key {key_slot}/{len(SARVAM_KEYS)} credits exhausted.")
-                    _sarvam_key_index = (_sarvam_key_index + 1) % len(SARVAM_KEYS)
-                    if exhausted_keys_this_attempt < len(SARVAM_KEYS):
-                        print(f"[Sarvam] Switching to API key {_sarvam_key_index + 1}/{len(SARVAM_KEYS)}...")
+                    # Rate limited on this key — rotate to next key immediately
+                    # instead of sleeping on the same one.
+                    if response.status_code == 429:
+                        print(f"[Sarvam] API key {key_slot}/{len(SARVAM_KEYS)} rate limited (429).")
+                        _sarvam_key_index = (_sarvam_key_index + 1) % len(SARVAM_KEYS)
+                        if keys_tried < len(SARVAM_KEYS):
+                            print(f"[Sarvam] Switching to API key {_sarvam_key_index + 1}/{len(SARVAM_KEYS)}...")
+                        continue
 
+                    # Usable response (200 or non-rotation error) — exit inner loop.
+                    _clear_sarvam_exhaustion_logger()
+                    break
                 else:
-                    _start_sarvam_exhaustion_logger()
-                    raise Exception("[Sarvam] ALL API KEY CREDITS EXHAUSTED. Add credits or configure another SARVAM_API_KEY.")
-
-                if response.status_code == 429:
+                    # Every configured key tried this attempt — all 402 and/or 429.
+                    if exhausted_count == len(SARVAM_KEYS):
+                        _start_sarvam_exhaustion_logger()
+                        raise Exception("[Sarvam] ALL API KEY CREDITS EXHAUSTED. Add credits or configure another SARVAM_API_KEY.")
+                    # All keys rate limited (or mix of 402 + 429). Back off, then retry.
                     wait = _retry_after_seconds(response, attempt)
-                    print(f"[Sarvam] Rate limited on chunk {i+1}. Waiting {wait}s (attempt {attempt}/{MAX_RETRIES})...")
+                    print(f"[Sarvam] All {len(SARVAM_KEYS)} keys rate limited on chunk {i+1}. Waiting {wait}s (attempt {attempt}/{MAX_RETRIES})...")
                     await asyncio.sleep(wait)
                     continue
 

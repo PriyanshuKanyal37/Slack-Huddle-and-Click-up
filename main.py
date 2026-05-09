@@ -75,7 +75,7 @@ async def poll_once():
         "Authorization": f"Token {RECALL_API_KEY}",
         "Content-Type": "application/json"
     }
-    since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    since = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
     for attempt in range(1, RECALL_MAX_RETRIES + 1):
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
