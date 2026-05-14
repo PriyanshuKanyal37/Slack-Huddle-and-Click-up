@@ -720,7 +720,7 @@ async def get_backlog_custom_fields() -> dict:
                 result[fid] = [{"id": o["id"], "name": o["name"]} for o in options]
         _custom_fields_cache     = result
         _custom_fields_fetched_at = time.time()
-        print(f"[ClickUp] Custom fields refreshed from API")
+        print("[ClickUp] Custom fields refreshed from API")
     except Exception as e:
         print(f"[ClickUp] get_backlog_custom_fields failed: {e} — using cached")
 

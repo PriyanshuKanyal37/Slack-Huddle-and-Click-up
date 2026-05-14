@@ -837,8 +837,6 @@ async def _handle_api_key_submit(payload: dict):
     private_metadata = json.loads(view.get("private_metadata", "{}"))
     state            = view.get("state", {}).get("values", {})
     slack_user_id    = payload.get("user", {}).get("id", "")
-    trigger_id       = payload.get("trigger_id", "")
-
     api_key        = (state.get("api_key_block", {}).get("key_value", {}).get("value") or "").strip()
     pending_action = private_metadata.get("pending_action", "")
     action_value   = private_metadata.get("action_value", {})

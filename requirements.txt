@@ -6,3 +6,5 @@ openai
 upstash-redis
 slack-sdk
 python-multipart
+sarvamai
+imageio-ffmpeg

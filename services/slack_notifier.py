@@ -2,13 +2,14 @@ import httpx
 import json
 import os
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from upstash_redis.asyncio import Redis as _UpstashRedis
 
 load_dotenv()
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_ONLY_DM_USER_ID = os.getenv("SLACK_ONLY_DM_USER_ID", "").strip()
 HEADERS = {
     "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
     "Content-Type": "application/json"
@@ -194,8 +195,17 @@ async def send_meeting_dms(notes: dict, metadata: dict):
     first_names = ", ".join(n.split()[0] for n in participant_names if n)
     fallback_text = f"🎙️ {dt_str} IST · {short_title} · {first_names}"
 
-    for name in participant_names:
-        slack_user_id = _match_slack_user(name)
+    if SLACK_ONLY_DM_USER_ID:
+        dm_targets = [{"name": "test recipient", "slack_user_id": SLACK_ONLY_DM_USER_ID}]
+    else:
+        dm_targets = [
+            {"name": name, "slack_user_id": _match_slack_user(name)}
+            for name in participant_names
+        ]
+
+    for target in dm_targets:
+        name = target["name"]
+        slack_user_id = target["slack_user_id"]
         if not slack_user_id:
             print(f"[Slack DM] No Slack user matched for '{name}' — skipping.")
             continue

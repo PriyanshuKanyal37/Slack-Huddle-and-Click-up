@@ -24,11 +24,16 @@ from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from dotenv import load_dotenv
 from upstash_redis.asyncio import Redis
-from services.transcriber import transcribe_audio
+from services.transcriber import transcribe_audio_detailed
 from services.summarizer import structure_notes, extract_meeting_keywords
 from services.clickup import create_meeting_task, search_relevant_tasks
 from services.slack_notifier import send_meeting_dms
 from services.slack_interact import handle_interaction
+from services.clickup_brain import (
+    assign_participant_names,
+    format_speaker_transcript,
+    send_clickup_brain_channel_post,
+)
 
 load_dotenv()
 
@@ -38,6 +43,7 @@ RECALL_MAX_RETRIES    = 5
 RECALL_WEBHOOK_SECRET = os.getenv("RECALL_WEBHOOK_SECRET", "")
 SLACK_SIGNING_SECRET  = os.getenv("SLACK_SIGNING_SECRET", "")
 BOT_KEY_TTL           = 90 * 24 * 60 * 60   # 90 days in seconds
+PIPELINE_LOCK_TTL_SECONDS = int(os.getenv("PIPELINE_LOCK_TTL_SECONDS", str(6 * 60 * 60)))
 
 redis = Redis(
     url=os.getenv("UPSTASH_REDIS_URL"),
@@ -136,6 +142,27 @@ async def mark_processed(bot_id: str):
         print(f"[Redis] mark_processed failed for {bot_id}: {e}")
 
 
+async def acquire_pipeline_lock(bot_id: str, redis_client=redis) -> bool:
+    try:
+        result = await redis_client.set(
+            f"bot_lock:{bot_id}",
+            "1",
+            nx=True,
+            ex=PIPELINE_LOCK_TTL_SECONDS,
+        )
+        return result in (True, "OK", 1)
+    except Exception as e:
+        print(f"[Redis] acquire_pipeline_lock failed for {bot_id}: {e} — using local in-process guard only")
+        return True
+
+
+async def release_pipeline_lock(bot_id: str, redis_client=redis):
+    try:
+        await redis_client.delete(f"bot_lock:{bot_id}")
+    except Exception as e:
+        print(f"[Redis] release_pipeline_lock failed for {bot_id}: {e}")
+
+
 # ── WEBHOOK SIGNATURE VERIFICATION ───────────────────────────────────────────
 
 def verify_signature(body: bytes, signature_header: str) -> bool:
@@ -160,8 +187,12 @@ def verify_slack_signature(body: bytes, headers) -> bool:
     slack_sig = headers.get("X-Slack-Signature", "")
     if not timestamp or not slack_sig:
         return False
+    try:
+        request_time = int(timestamp)
+    except ValueError:
+        return False
     # Reject replayed requests older than 5 minutes
-    if abs(time.time() - int(timestamp)) > 300:
+    if abs(time.time() - request_time) > 300:
         return False
     basestring = f"v0:{timestamp}:{body.decode('utf-8')}"
     computed = "v0=" + hmac.new(
@@ -170,6 +201,21 @@ def verify_slack_signature(body: bytes, headers) -> bool:
         hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(computed, slack_sig)
+
+
+def _recall_done_bot_id(payload: dict) -> str:
+    event = payload.get("event", "")
+    data = payload.get("data") or {}
+    bot = data.get("bot") or {}
+    status = data.get("status") or {}
+
+    if event == "bot.done":
+        return bot.get("id") or data.get("bot_id") or ""
+    if event == "recording.done":
+        return bot.get("id") or data.get("bot_id") or ""
+    if event == "bot.status_change" and status.get("code") == "done":
+        return bot.get("id") or data.get("bot_id") or ""
+    return ""
 
 
 # ── RECALL.AI AUTO-JOIN ───────────────────────────────────────────────────────
@@ -233,6 +279,11 @@ async def run_pipeline(bot_id: str):
         print(f"[Pipeline] Bot {bot_id} already processed/in-progress/failed. Skipping.")
         return
 
+    lock_acquired = await acquire_pipeline_lock(bot_id)
+    if not lock_acquired:
+        print(f"[Pipeline] Bot {bot_id} is locked by another worker. Skipping.")
+        return
+
     in_progress.add(bot_id)
     print(f"\n[Pipeline] Processing bot: {bot_id}")
 
@@ -255,7 +306,6 @@ async def run_pipeline(bot_id: str):
 
         if not media_url:
             print(f"[Pipeline] No media URL found for bot {bot_id}. Will retry next poll.")
-            in_progress.discard(bot_id)
             return
 
         # Meeting metadata
@@ -263,27 +313,50 @@ async def run_pipeline(bot_id: str):
         recordings = details.get("recordings", [])
         ended_at = recordings[0].get("completed_at", "") if recordings else ""
 
-        # participants: fetch from Recall.ai participants endpoint
+        # participants + speaker timeline: fetch Recall.ai participant artifacts.
+        # Sarvam owns transcription/diarization; Recall timeline is used only to map speakers to names.
         participants = []
+        speaker_timeline = []
         try:
             participant_events = (recordings[0].get("media_shortcuts", {}).get("participant_events") or {})
-            participants_url = (participant_events.get("data") or {}).get("participants_download_url", "")
+            participant_data = participant_events.get("data") or {}
+            participants_url = participant_data.get("participants_download_url", "")
             if participants_url:
                 async with httpx.AsyncClient(timeout=30) as client:
                     p_resp = await client.get(participants_url)
                 if p_resp.status_code == 200:
                     participants = [p.get("name", "") for p in p_resp.json() if p.get("name")]
+            speaker_timeline_url = (
+                participant_data.get("speaker_timeline_download_url")
+                or participant_data.get("speakerTimeline_download_url")
+                or participant_data.get("speaker_timeline_url")
+            )
+            if speaker_timeline_url:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    st_resp = await client.get(speaker_timeline_url)
+                if st_resp.status_code == 200:
+                    timeline_payload = st_resp.json()
+                    if isinstance(timeline_payload, list):
+                        speaker_timeline = timeline_payload
+                    elif isinstance(timeline_payload, dict):
+                        for key in ("speaker_timeline", "timeline", "events", "results", "data"):
+                            value = timeline_payload.get(key)
+                            if isinstance(value, list):
+                                speaker_timeline = value
+                                break
         except Exception as e:
-            print(f"[Pipeline] Could not fetch participants: {e}")
+            print(f"[Pipeline] Could not fetch Recall participant artifacts: {e}")
 
         # Calculate duration in minutes
         duration_minutes = 0
+        duration_seconds = 0.0
         try:
             if recordings:
                 rec0 = recordings[0]
                 t_start = datetime.fromisoformat(rec0.get("started_at", "").replace("Z", "+00:00"))
                 t_end   = datetime.fromisoformat(rec0.get("completed_at", "").replace("Z", "+00:00"))
-                duration_minutes = int((t_end - t_start).total_seconds() / 60)
+                duration_seconds = max(0.0, (t_end - t_start).total_seconds())
+                duration_minutes = int(duration_seconds / 60)
         except Exception:
             pass
 
@@ -293,6 +366,7 @@ async def run_pipeline(bot_id: str):
             "started_at": details.get("join_at", ""),
             "ended_at": ended_at,
             "duration_minutes": duration_minutes,
+            "duration_seconds": duration_seconds,
             "slack_channel": details.get("meeting_url", "")
         }
 
@@ -313,7 +387,8 @@ async def run_pipeline(bot_id: str):
 
             # Step 2 — Transcribe with Sarvam AI (Hindi → English)
             print("[Step 2] Transcribing with Sarvam AI...")
-            transcript = await transcribe_audio(tmp_media_path)
+            transcript_result = await transcribe_audio_detailed(tmp_media_path)
+            transcript = transcript_result.text
             print(f"[Step 2] Transcript: {transcript[:200]}...")
 
         finally:
@@ -354,17 +429,31 @@ async def run_pipeline(bot_id: str):
         except Exception as e:
             print(f"[Step 6] Slack DM failed (non-fatal): {e}")
 
+        # Step 7 — Send full speaker transcript to ClickUp Brain Slack channel
+        print("[Step 7] Sending ClickUp Brain channel transcript...")
+        try:
+            named_transcript = assign_participant_names(
+                transcript_result,
+                speaker_timeline,
+                duration_seconds=metadata.get("duration_seconds") or None,
+            )
+            transcript_text = format_speaker_transcript(named_transcript, metadata, notes)
+            await send_clickup_brain_channel_post(notes, metadata, named_transcript, transcript_text)
+        except Exception as e:
+            print(f"[Step 7] ClickUp Brain channel post failed (non-fatal): {e}")
+
         await mark_processed(bot_id)
-        in_progress.discard(bot_id)
         print(f"[Pipeline] Done. Bot {bot_id} marked as processed.")
 
     except Exception as e:
-        in_progress.discard(bot_id)
         count = failed_bots.get(bot_id, 0) + 1
         failed_bots[bot_id] = count
         print(f"[Pipeline] ERROR for bot {bot_id} (attempt {count}/3): {e}")
         if count >= 3:
             print(f"[Pipeline] Bot {bot_id} failed 3 times — skipping permanently.")
+    finally:
+        in_progress.discard(bot_id)
+        await release_pipeline_lock(bot_id)
 
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
@@ -383,15 +472,17 @@ async def recall_webhook(request: Request, background_tasks: BackgroundTasks):
     if not verify_signature(body, signature):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
-    payload = json.loads(body)
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from None
     event = payload.get("event", "")
 
     # Only process when bot recording is fully done
-    if event != "bot.done":
+    bot_id = _recall_done_bot_id(payload)
+    if not bot_id:
         print(f"[Webhook] Ignored — event: {event}")
         return {"status": "ignored"}
-
-    bot_id = payload["data"]["bot"]["id"]
 
     # Skip if already processed
     if await is_processed(bot_id):
@@ -414,7 +505,10 @@ async def slack_webhook(request: Request, background_tasks: BackgroundTasks):
     if not verify_slack_signature(body, request.headers):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
 
-    payload = json.loads(body)
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from None
 
     # Slack requires this one-time challenge when you first register the URL
     if payload.get("type") == "url_verification":
