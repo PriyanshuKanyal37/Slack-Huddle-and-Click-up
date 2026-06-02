@@ -52,6 +52,11 @@ RECALL_SLACK_TEAM_ID = os.getenv("RECALL_SLACK_TEAM_ID", "")
 SLACK_CLIENT_ID      = os.getenv("SLACK_CLIENT_ID", "")
 SLACK_CLIENT_SECRET  = os.getenv("SLACK_CLIENT_SECRET", "")
 SLACK_REDIRECT_URI   = os.getenv("SLACK_REDIRECT_URI", "")
+
+# ── Huddle-start nudge (DM user to add the recorder when no bot auto-joins) ────
+RECALL_BOT_SLACK_USER_ID   = os.getenv("RECALL_BOT_SLACK_USER_ID", "U0ALGV44B2R")  # "Huddle Notes Bot" member
+APP_BOT_SLACK_USER_ID      = os.getenv("APP_BOT_SLACK_USER_ID", "U0AMDQMKMKK")     # "Haddle Bot" app user
+HUDDLE_NUDGE_GRACE_SECONDS = int(os.getenv("HUDDLE_NUDGE_GRACE_SECONDS", "10"))
 BOT_KEY_TTL           = 90 * 24 * 60 * 60   # 90 days in seconds
 PIPELINE_LOCK_TTL_SECONDS = int(os.getenv("PIPELINE_LOCK_TTL_SECONDS", str(6 * 60 * 60)))
 
@@ -563,6 +568,22 @@ async def slack_webhook(request: Request, background_tasks: BackgroundTasks):
             already_auth = await redis.exists(f"slack_oauth:{user_id}") == 1
             background_tasks.add_task(_publish_app_home, user_id, already_auth)
 
+    # Huddle started — nudge the user to add the recorder, unless a bot auto-joins (public/member channel)
+    if event_type == "user_huddle_changed":
+        u            = event.get("user", {}) or {}
+        user_id      = u.get("id", "")
+        profile      = u.get("profile", {}) or {}
+        huddle_state = profile.get("huddle_state", "")
+        call_id      = profile.get("huddle_state_call_id", "")
+        if (
+            huddle_state == "in_a_huddle"
+            and user_id
+            and call_id
+            and user_id not in (RECALL_BOT_SLACK_USER_ID, APP_BOT_SLACK_USER_ID)
+        ):
+            started_ts = datetime.now(timezone.utc).isoformat()
+            background_tasks.add_task(_huddle_nudge_flow, user_id, call_id, started_ts)
+
     return {"status": "ok"}
 
 
@@ -642,6 +663,69 @@ async def _publish_app_home(user_id: str, authorized: bool):
             headers=headers,
             json={"user_id": user_id, "view": {"type": "home", "blocks": blocks}},
         )
+
+
+async def _recall_bot_joined_since(cutoff: datetime) -> bool:
+    """True if any Recall bot began joining a call at/after cutoff (i.e. a huddle is being covered)."""
+    headers = {"Authorization": f"Token {RECALL_API_KEY}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{RECALL_BASE_URL}/bot/",
+                headers=headers,
+                params={"ordering": "-created_at", "page_size": 5},
+            )
+        resp.raise_for_status()
+        for bot in resp.json().get("results", []):
+            changes = bot.get("status_changes") or []
+            if not changes:
+                continue
+            first_ts = changes[0].get("created_at", "")
+            try:
+                t = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if t >= cutoff:
+                return True
+    except Exception as e:
+        print(f"[Huddle Nudge] Recall check failed: {e}")
+    return False
+
+
+async def _huddle_nudge_flow(user_id: str, call_id: str, started_ts: str):
+    """
+    After an authorized user starts a huddle: claim it (dedup), wait a grace
+    window, and nudge to add the recorder ONLY if no bot auto-joined.
+    """
+    # 1. Claim — exactly one nudge per huddle, atomic across racing participants/retries
+    try:
+        claimed = await redis.set(f"huddle_nudge:{call_id}", user_id, nx=True, ex=2 * 60 * 60)
+    except Exception as e:
+        print(f"[Huddle Nudge] claim failed for {call_id}: {e} — proceeding")
+        claimed = True  # fail open — a rare dup beats silent failure
+    if claimed not in (True, "OK", 1):
+        return
+
+    # 2. Grace window — give auto-join (public / member channel) or a manual add time to appear
+    await asyncio.sleep(HUDDLE_NUDGE_GRACE_SECONDS)
+
+    # 3. Suppress if a bot showed up (public auto-join, member channel, already recording)
+    try:
+        cutoff = datetime.fromisoformat(started_ts) - timedelta(seconds=5)
+    except Exception:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=HUDDLE_NUDGE_GRACE_SECONDS + 5)
+    if await _recall_bot_joined_since(cutoff):
+        print(f"[Huddle Nudge] Bot already covering huddle {call_id} — no nudge.")
+        return
+
+    # 4. Nudge — sent by the app (Haddle Bot), telling the user to add the recorder member
+    await _send_dm(
+        user_id,
+        ":red_circle: *Huddle started.* Want notes in ClickUp?\n"
+        "Tap the *Invite people* icon in your huddle and add *Huddle Notes Bot* — "
+        "it records and posts notes automatically.",
+    )
+    print(f"[Huddle Nudge] Sent to {user_id} for huddle {call_id}.")
 
 
 async def _handle_dm_message(event: dict):
