@@ -250,6 +250,29 @@ async def send_meeting_dms(notes: dict, metadata: dict):
                         await _redis.expire(f"dm_participants:{meeting_id}", DM_SESSION_TTL)
                     except Exception as e:
                         print(f"[Slack DM] Failed to store DM info for '{name}': {e}")
+
+                # One-time nudge — only for users who haven't enabled private recording yet
+                try:
+                    already_auth = await _redis.exists(f"slack_oauth:{slack_user_id}") == 1
+                    if not already_auth:
+                        base_url = os.getenv("SLACK_REDIRECT_URI", "").replace("/auth/slack/callback", "")
+                        if base_url:
+                            auth_url = f"{base_url}/auth/slack?user_id={slack_user_id}"
+                            nudge = [{
+                                "type": "context",
+                                "elements": [{
+                                    "type": "mrkdwn",
+                                    "text": f":lock: <{auth_url}|Enable private call recording> — so the bot can also join your private channel and DM huddles."
+                                }]
+                            }]
+                            async with httpx.AsyncClient(timeout=10) as client:
+                                await client.post(
+                                    "https://slack.com/api/chat.postMessage",
+                                    headers=HEADERS,
+                                    json={"channel": channel_id, "blocks": nudge, "text": "Enable private call recording"},
+                                )
+                except Exception as e:
+                    print(f"[Slack DM] Auth nudge failed for '{name}': {e}")
             else:
                 print(f"[Slack DM] Failed for '{name}': {resp_data.get('error')}")
 

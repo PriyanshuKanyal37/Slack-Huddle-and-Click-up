@@ -18,10 +18,13 @@ import hmac
 import httpx
 import json
 import os
+import secrets
 import tempfile
 import time
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlencode
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
 from dotenv import load_dotenv
 from upstash_redis.asyncio import Redis
 from services.transcriber import transcribe_audio_detailed
@@ -42,6 +45,13 @@ RECALL_BASE_URL       = "https://ap-northeast-1.recall.ai/api/v1"
 RECALL_MAX_RETRIES    = 5
 RECALL_WEBHOOK_SECRET = os.getenv("RECALL_WEBHOOK_SECRET", "")
 SLACK_SIGNING_SECRET  = os.getenv("SLACK_SIGNING_SECRET", "")
+
+# ── Private-huddle OAuth (per-user Slack token → Recall.ai v2) ────────────────
+RECALL_BASE_URL_V2   = "https://ap-northeast-1.recall.ai/api/v2"  # same region as v1
+RECALL_SLACK_TEAM_ID = os.getenv("RECALL_SLACK_TEAM_ID", "")
+SLACK_CLIENT_ID      = os.getenv("SLACK_CLIENT_ID", "")
+SLACK_CLIENT_SECRET  = os.getenv("SLACK_CLIENT_SECRET", "")
+SLACK_REDIRECT_URI   = os.getenv("SLACK_REDIRECT_URI", "")
 BOT_KEY_TTL           = 90 * 24 * 60 * 60   # 90 days in seconds
 PIPELINE_LOCK_TTL_SECONDS = int(os.getenv("PIPELINE_LOCK_TTL_SECONDS", str(6 * 60 * 60)))
 
@@ -546,7 +556,92 @@ async def slack_webhook(request: Request, background_tasks: BackgroundTasks):
             active_huddles.discard(channel_id)
             print(f"[AutoJoin] Huddle ended in {channel_id}. Channel cleared.")
 
+    # App Home opened — show enable button (or confirmation if already authorized)
+    if event_type == "app_home_opened":
+        user_id = event.get("user", "")
+        if user_id:
+            already_auth = await redis.exists(f"slack_oauth:{user_id}") == 1
+            background_tasks.add_task(_publish_app_home, user_id, already_auth)
+
     return {"status": "ok"}
+
+
+async def _send_dm(slack_user_id: str, text: str):
+    """Open a DM channel with a user and post a plain-text message."""
+    headers = {
+        "Authorization": f"Bearer {os.getenv('SLACK_BOT_TOKEN')}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=10) as client:
+        open_resp = await client.post(
+            "https://slack.com/api/conversations.open",
+            headers=headers,
+            json={"users": slack_user_id},
+        )
+    channel_id = open_resp.json().get("channel", {}).get("id")
+    if not channel_id:
+        return
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(
+            "https://slack.com/api/chat.postMessage",
+            headers=headers,
+            json={"channel": channel_id, "text": text},
+        )
+
+
+async def _publish_app_home(user_id: str, authorized: bool):
+    """
+    Publish the App Home tab view.
+    Authorized users see a confirmation; others see the enable button.
+    """
+    base_url = SLACK_REDIRECT_URI.replace("/auth/slack/callback", "")
+    auth_url = f"{base_url}/auth/slack?user_id={user_id}"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('SLACK_BOT_TOKEN')}",
+        "Content-Type": "application/json",
+    }
+    if authorized:
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: *Private huddle recording is enabled.*\nThe bot will join your DM and private channel huddles when one starts.",
+                },
+            }
+        ]
+    else:
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        ":microphone: *Enable private call recording*\n"
+                        "The bot already joins public channel huddles. "
+                        "Authorize once below so it can also join your private channel and DM huddles."
+                    ),
+                },
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Enable Private Recording"},
+                        "style": "primary",
+                        "url": auth_url,
+                        "action_id": "enable_private_recording",
+                    }
+                ],
+            },
+        ]
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(
+            "https://slack.com/api/views.publish",
+            headers=headers,
+            json={"user_id": user_id, "view": {"type": "home", "blocks": blocks}},
+        )
 
 
 async def _handle_dm_message(event: dict):
@@ -606,6 +701,80 @@ async def _handle_dm_message(event: dict):
             json={"channel": channel, "text": reply}
         )
 
+
+
+@app.get("/auth/slack")
+async def slack_oauth_start(request: Request):
+    """OAuth entry — generate CSRF state, redirect user to Slack consent screen."""
+    state = secrets.token_urlsafe(16)
+    user_id = request.query_params.get("user_id", "")
+    await redis.set(f"slack_oauth_state:{state}", user_id or "unknown", ex=300)
+    params = urlencode({
+        "client_id": SLACK_CLIENT_ID,
+        "user_scope": "channels:read groups:read im:read mpim:read team:read users:read",
+        "redirect_uri": SLACK_REDIRECT_URI,
+        "state": state,
+    })
+    return RedirectResponse(f"https://slack.com/oauth/v2/authorize?{params}")
+
+
+@app.get("/auth/slack/callback")
+async def slack_oauth_callback(code: str, state: str):
+    """Slack redirect target — exchange code for user token, register it with Recall.ai."""
+    # 1. Verify CSRF state
+    stored = await redis.get(f"slack_oauth_state:{state}")
+    if not stored:
+        raise HTTPException(status_code=400, detail="Invalid or expired state")
+    await redis.delete(f"slack_oauth_state:{state}")
+
+    # 2. Exchange code → user token (xoxp- prefix)
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            "https://slack.com/api/oauth.v2.access",
+            data={
+                "client_id": SLACK_CLIENT_ID,
+                "client_secret": SLACK_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": SLACK_REDIRECT_URI,
+            },
+        )
+    data = resp.json()
+    if not data.get("ok"):
+        raise HTTPException(status_code=400, detail=f"Slack OAuth failed: {data.get('error')}")
+
+    authed_user = data.get("authed_user") or {}
+    user_token    = authed_user.get("access_token", "")  # xoxp- user token, NOT bot token
+    slack_user_id = authed_user.get("id", "")
+    if not user_token or not slack_user_id:
+        raise HTTPException(status_code=400, detail="Slack did not return a user token")
+
+    # 3. Register user token with Recall.ai v2
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(
+            f"{RECALL_BASE_URL_V2}/slack-teams/{RECALL_SLACK_TEAM_ID}/oauth-tokens/",
+            headers={
+                "Authorization": f"Token {RECALL_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"token": user_token},
+        )
+    if r.status_code not in (200, 201):
+        print(f"[OAuth] Recall token POST failed ({r.status_code}): {r.text}")
+        raise HTTPException(status_code=500, detail="Failed to register token with Recall")
+    print(f"[OAuth] Registered Recall token for user {slack_user_id} ({r.status_code})")
+
+    # 4. Mark user authorized + send confirm DM + refresh App Home
+    await redis.set(f"slack_oauth:{slack_user_id}", "1")
+    await _send_dm(
+        slack_user_id,
+        ":white_check_mark: Private huddle recording enabled. The bot will now join your DM and private channel huddles.",
+    )
+    try:
+        await _publish_app_home(slack_user_id, True)
+    except Exception as e:
+        print(f"[OAuth] App Home refresh failed: {e}")
+
+    return HTMLResponse("<html><body><h2>Done! You can close this tab.</h2></body></html>")
 
 
 @app.post("/webhook/slack-options")
