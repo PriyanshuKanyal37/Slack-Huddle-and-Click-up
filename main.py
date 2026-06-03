@@ -721,9 +721,9 @@ async def _huddle_nudge_flow(user_id: str, call_id: str, started_ts: str):
     # 4. Nudge — sent by the app (Haddle Bot), telling the user to add the recorder member
     await _send_dm(
         user_id,
-        ":red_circle: *Huddle started.* Want notes in ClickUp?\n"
-        "Tap the *Invite people* icon in your huddle and add *Huddle Notes Bot* — "
-        "it records and posts notes automatically.",
+        ":red_circle: *Add \"Huddle Notes Bot\" to record this huddle.*\n"
+        "Tap *Invite people* (person+ icon) in the huddle → pick *Huddle Notes Bot*.\n"
+        "Notes post to ClickUp automatically.",
     )
     print(f"[Huddle Nudge] Sent to {user_id} for huddle {call_id}.")
 
