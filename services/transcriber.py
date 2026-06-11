@@ -533,7 +533,11 @@ def _prepare_batch_audio_parts_sync(media_path: str) -> dict:
         raise
 
 
-def _run_sarvam_batch_job_sync(media_path: str, api_key: str) -> SarvamTranscriptResult:
+def _run_sarvam_batch_job_sync(
+    media_path: str,
+    api_key: str,
+    batch_mode: str | None = None,
+) -> SarvamTranscriptResult:
     try:
         from sarvamai import SarvamAI
     except ImportError as exc:
@@ -545,7 +549,7 @@ def _run_sarvam_batch_job_sync(media_path: str, api_key: str) -> SarvamTranscrip
         client = SarvamAI(api_subscription_key=api_key, timeout=SARVAM_BATCH_TIMEOUT_SECONDS)
         kwargs = {
             "model": SARVAM_BATCH_MODEL,
-            "mode": SARVAM_BATCH_MODE,
+            "mode": batch_mode or SARVAM_BATCH_MODE,
             "language_code": SARVAM_BATCH_LANGUAGE_CODE,
             "with_diarization": True,
             "with_timestamps": True,
@@ -601,7 +605,10 @@ def _run_sarvam_batch_job_sync(media_path: str, api_key: str) -> SarvamTranscrip
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
-async def _transcribe_audio_batch(media_path: str) -> SarvamTranscriptResult:
+async def _transcribe_audio_batch(
+    media_path: str,
+    batch_mode: str | None = None,
+) -> SarvamTranscriptResult:
     global _sarvam_key_index
     if not SARVAM_KEYS:
         raise Exception("[Sarvam Batch] No API keys configured. Set SARVAM_API_KEY or SARVAM_API_KEY_1..3.")
@@ -612,7 +619,12 @@ async def _transcribe_audio_batch(media_path: str) -> SarvamTranscriptResult:
         while keys_tried < len(SARVAM_KEYS):
             key_slot = _sarvam_key_index + 1
             try:
-                result = await asyncio.to_thread(_run_sarvam_batch_job_sync, media_path, SARVAM_KEYS[_sarvam_key_index])
+                result = await asyncio.to_thread(
+                    _run_sarvam_batch_job_sync,
+                    media_path,
+                    SARVAM_KEYS[_sarvam_key_index],
+                    batch_mode,
+                )
                 _clear_sarvam_exhaustion_logger()
                 return result
             except Exception as exc:
@@ -646,6 +658,10 @@ async def _transcribe_audio_batch(media_path: str) -> SarvamTranscriptResult:
             await asyncio.sleep(wait)
 
     raise Exception("[Sarvam Batch] failed after retries. " + " | ".join(errors))
+
+
+async def transcribe_audio_batch_mode(media_path: str, batch_mode: str) -> SarvamTranscriptResult:
+    return await _transcribe_audio_batch(media_path, batch_mode=batch_mode)
 
 
 async def _transcribe_audio_rest_detailed(media_path: str) -> SarvamTranscriptResult:

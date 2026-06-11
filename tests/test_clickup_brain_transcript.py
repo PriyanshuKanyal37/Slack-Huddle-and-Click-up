@@ -205,6 +205,38 @@ def test_format_speaker_transcript_includes_metadata_and_timestamps():
     assert "[01:02.000 - 01:05.300] Shivam:" in text
 
 
+def test_format_speaker_transcript_accepts_custom_heading():
+    result = SarvamTranscriptResult(
+        text="Haan sir.",
+        source="batch/translit + conservative validation",
+        entries=[
+            {
+                "speaker_id": "0",
+                "speaker_name": "Priyanshu",
+                "start_time_seconds": 0.25,
+                "end_time_seconds": 2.5,
+                "transcript": "Haan sir.",
+            },
+        ],
+    )
+
+    text = format_speaker_transcript(
+        result,
+        {
+            "meeting_id": "bot-1",
+            "started_at": "2026-05-14T04:48:59Z",
+            "duration_minutes": 1,
+            "participants": ["Priyanshu"],
+        },
+        {"meeting_title": "ClickUp Brain Planning"},
+        heading="Validated Roman-Hinglish Speaker Transcript",
+    )
+
+    assert "Validated Roman-Hinglish Speaker Transcript" in text
+    assert "Transcript source: Sarvam AI batch/translit + conservative validation" in text
+    assert "\nSpeaker Transcript\n==================\n" not in text
+
+
 def test_format_speaker_transcript_surfaces_ambiguous_speaker_matches():
     result = SarvamTranscriptResult(
         text="Mixed segment.",
@@ -383,6 +415,49 @@ def test_clickup_brain_upload_uses_initial_comment_without_separate_message(monk
     assert len(calls) == 1
     assert calls[0]["initial_comment"].startswith("*New Huddle Transcript:* Planning")
     assert calls[0]["thread_ts"] == ""
+
+
+def test_clickup_brain_uploads_hinglish_transcript_as_second_file(monkeypatch):
+    calls = []
+
+    async def fake_upload(channel_id, filename, title, content, initial_comment="", thread_ts=""):
+        calls.append(
+            {
+                "channel_id": channel_id,
+                "filename": filename,
+                "title": title,
+                "content": content,
+                "initial_comment": initial_comment,
+                "thread_ts": thread_ts,
+            }
+        )
+
+    async def fail_if_message_posted(method, payload):
+        raise AssertionError(f"unexpected Slack method: {method}")
+
+    monkeypatch.setattr(clickup_brain, "CLICKUP_BRAIN_CHANNEL_ID", "C123")
+    monkeypatch.setattr(clickup_brain, "upload_text_file_to_slack", fake_upload)
+    monkeypatch.setattr(clickup_brain, "_slack_api_post", fail_if_message_posted)
+
+    transcript = SarvamTranscriptResult(text="Hello.", source="batch", entries=[])
+
+    asyncio.run(
+        clickup_brain.send_clickup_brain_channel_post(
+            {"meeting_title": "Planning"},
+            {"meeting_id": "bot-1", "participants": [], "duration_minutes": 1},
+            transcript,
+            "English transcript",
+            hinglish_transcript_text="Haan sir.",
+        )
+    )
+
+    assert [call["filename"] for call in calls] == [
+        "bot-1-speaker-transcript.txt",
+        "bot-1-hinglish-speaker-transcript.txt",
+    ]
+    assert calls[0]["initial_comment"].startswith("*New Huddle Transcript:* Planning")
+    assert calls[1]["content"] == "Haan sir."
+    assert calls[1]["initial_comment"] == "*Roman-Hinglish transcript:* Planning"
 
 
 def test_channel_summary_formats_action_points_without_buttons():

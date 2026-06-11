@@ -236,6 +236,7 @@ def format_speaker_transcript(
     transcript: SarvamTranscriptResult,
     metadata: dict,
     notes: dict | None = None,
+    heading: str = "Speaker Transcript",
 ) -> str:
     notes = notes or {}
     title = notes.get("meeting_title") or "Untitled Meeting"
@@ -247,8 +248,8 @@ def format_speaker_transcript(
         f"Participants: {_participant_list(metadata)}",
         f"Transcript source: Sarvam AI {transcript.source}",
         "",
-        "Speaker Transcript",
-        "==================",
+        heading,
+        "=" * len(heading),
         "",
     ]
 
@@ -411,6 +412,7 @@ async def send_clickup_brain_channel_post(
     metadata: dict,
     transcript: SarvamTranscriptResult,
     transcript_text: str,
+    hinglish_transcript_text: str | None = None,
 ):
     if not CLICKUP_BRAIN_CHANNEL_ID:
         print("[ClickUp Brain] Channel env var not configured; skipping channel post.")
@@ -427,6 +429,12 @@ async def send_clickup_brain_channel_post(
             transcript_text,
             initial_comment=summary,
         )
+        if hinglish_transcript_text:
+            await _upload_hinglish_transcript_file(
+                notes,
+                metadata,
+                hinglish_transcript_text,
+            )
         return
     except Exception as exc:
         print(f"[ClickUp Brain] File upload failed; posting transcript in thread: {exc}")
@@ -457,6 +465,26 @@ async def send_clickup_brain_channel_post(
                 "unfurl_media": False,
             },
         )
+
+
+async def _upload_hinglish_transcript_file(
+    notes: dict,
+    metadata: dict,
+    transcript_text: str,
+):
+    safe_meeting_id = str(metadata.get("meeting_id", "meeting")).replace("/", "-")
+    filename = f"{safe_meeting_id}-hinglish-speaker-transcript.txt"
+    title = notes.get("meeting_title") or "Untitled Meeting"
+    try:
+        await upload_text_file_to_slack(
+            CLICKUP_BRAIN_CHANNEL_ID,
+            filename,
+            filename,
+            transcript_text,
+            initial_comment=f"*Roman-Hinglish transcript:* {title}",
+        )
+    except Exception as exc:
+        print(f"[ClickUp Brain] Hinglish transcript upload failed (non-fatal): {exc}")
 
 
 async def send_raw_json_debug(channel_id: str, filename: str, payload: dict | list):

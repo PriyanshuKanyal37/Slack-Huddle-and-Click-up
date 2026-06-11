@@ -37,6 +37,7 @@ from services.clickup_brain import (
     format_speaker_transcript,
     send_clickup_brain_channel_post,
 )
+from services.hinglish_transcript import build_validated_hinglish_transcript
 
 load_dotenv()
 
@@ -45,6 +46,7 @@ RECALL_BASE_URL       = "https://ap-northeast-1.recall.ai/api/v1"
 RECALL_MAX_RETRIES    = 5
 RECALL_WEBHOOK_SECRET = os.getenv("RECALL_WEBHOOK_SECRET", "")
 SLACK_SIGNING_SECRET  = os.getenv("SLACK_SIGNING_SECRET", "")
+ENABLE_HINGLISH_TRANSCRIPT = os.getenv("ENABLE_HINGLISH_TRANSCRIPT", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 # ── Private-huddle OAuth (per-user Slack token → Recall.ai v2) ────────────────
 RECALL_BASE_URL_V2   = "https://ap-northeast-1.recall.ai/api/v2"  # same region as v1
@@ -301,6 +303,7 @@ async def run_pipeline(bot_id: str):
 
     in_progress.add(bot_id)
     print(f"\n[Pipeline] Processing bot: {bot_id}")
+    tmp_media_path = ""
 
     try:
         # Fetch full bot details from Recall.ai
@@ -389,26 +392,21 @@ async def run_pipeline(bot_id: str):
         print("[Step 1] Downloading media from Recall.ai...")
         tmp_fd, tmp_media_path = tempfile.mkstemp(suffix=".mp4")
         os.close(tmp_fd)
-        try:
-            downloaded = 0
-            async with httpx.AsyncClient(timeout=800) as client:
-                async with client.stream("GET", media_url) as dl:
-                    dl.raise_for_status()
-                    with open(tmp_media_path, "wb") as f:
-                        async for chunk in dl.aiter_bytes(1024 * 1024):  # 1MB at a time
-                            f.write(chunk)
-                            downloaded += len(chunk)
-            print(f"[Step 1] Downloaded {downloaded / 1024 / 1024:.1f} MB")
+        downloaded = 0
+        async with httpx.AsyncClient(timeout=800) as client:
+            async with client.stream("GET", media_url) as dl:
+                dl.raise_for_status()
+                with open(tmp_media_path, "wb") as f:
+                    async for chunk in dl.aiter_bytes(1024 * 1024):  # 1MB at a time
+                        f.write(chunk)
+                        downloaded += len(chunk)
+        print(f"[Step 1] Downloaded {downloaded / 1024 / 1024:.1f} MB")
 
-            # Step 2 — Transcribe with Sarvam AI (Hindi → English)
-            print("[Step 2] Transcribing with Sarvam AI...")
-            transcript_result = await transcribe_audio_detailed(tmp_media_path)
-            transcript = transcript_result.text
-            print(f"[Step 2] Transcript: {transcript[:200]}...")
-
-        finally:
-            if os.path.exists(tmp_media_path):
-                os.unlink(tmp_media_path)
+        # Step 2 — Transcribe with Sarvam AI (Hindi → English)
+        print("[Step 2] Transcribing with Sarvam AI...")
+        transcript_result = await transcribe_audio_detailed(tmp_media_path)
+        transcript = transcript_result.text
+        print(f"[Step 2] Transcript: {transcript[:200]}...")
 
         # Step 3 — Extract keywords from transcript → search ClickUp workspace
         relevant_tasks = []
@@ -453,7 +451,31 @@ async def run_pipeline(bot_id: str):
                 duration_seconds=metadata.get("duration_seconds") or None,
             )
             transcript_text = format_speaker_transcript(named_transcript, metadata, notes)
-            await send_clickup_brain_channel_post(notes, metadata, named_transcript, transcript_text)
+            hinglish_transcript_text = None
+            if ENABLE_HINGLISH_TRANSCRIPT and tmp_media_path and os.path.exists(tmp_media_path):
+                try:
+                    print("[Step 7] Generating validated Roman-Hinglish transcript...")
+                    hinglish_transcript = await build_validated_hinglish_transcript(
+                        tmp_media_path,
+                        named_transcript,
+                        speaker_timeline,
+                        duration_seconds=metadata.get("duration_seconds") or None,
+                    )
+                    hinglish_transcript_text = format_speaker_transcript(
+                        hinglish_transcript,
+                        metadata,
+                        notes,
+                        heading="Validated Roman-Hinglish Speaker Transcript",
+                    )
+                except Exception as e:
+                    print(f"[Step 7] Hinglish transcript generation failed (non-fatal): {e}")
+            await send_clickup_brain_channel_post(
+                notes,
+                metadata,
+                named_transcript,
+                transcript_text,
+                hinglish_transcript_text=hinglish_transcript_text,
+            )
         except Exception as e:
             print(f"[Step 7] ClickUp Brain channel post failed (non-fatal): {e}")
 
@@ -467,6 +489,8 @@ async def run_pipeline(bot_id: str):
         if count >= 3:
             print(f"[Pipeline] Bot {bot_id} failed 3 times — skipping permanently.")
     finally:
+        if tmp_media_path and os.path.exists(tmp_media_path):
+            os.unlink(tmp_media_path)
         in_progress.discard(bot_id)
         await release_pipeline_lock(bot_id)
 
