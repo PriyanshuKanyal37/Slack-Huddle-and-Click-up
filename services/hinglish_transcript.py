@@ -7,6 +7,14 @@ from openai import AsyncOpenAI
 from services.clickup_brain import assign_participant_names
 from services.transcriber import SarvamTranscriptResult, transcribe_audio_batch_mode
 
+openai_key = os.getenv("OPENAI_API_KEY")
+openai_client_default = AsyncOpenAI(api_key=openai_key) if openai_key else None
+
+deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+deepseek_client = AsyncOpenAI(
+    api_key=deepseek_key,
+    base_url="https://api.deepseek.com"
+) if deepseek_key else None
 
 HINGLISH_VALIDATION_MODEL = os.getenv("HINGLISH_VALIDATION_MODEL", "gpt-5.1")
 HINGLISH_VALIDATION_CHUNK_CHARS = int(os.getenv("HINGLISH_VALIDATION_CHUNK_CHARS", "9000"))
@@ -86,7 +94,7 @@ async def validate_hinglish_transcript(
             source="batch/translit + conservative validation",
         )
 
-    openai_client = client or AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    openai_client = client or openai_client_default
     corrected_by_id = {}
     system_prompt = (
         "You clean Roman Hinglish ASR transcripts for internal Indian startup meetings. "
@@ -105,16 +113,35 @@ async def validate_hinglish_transcript(
             "Clean these Roman Hinglish transcript segments conservatively:\n"
             + json.dumps({"entries": chunk}, ensure_ascii=False)
         )
-        response = await openai_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            max_completion_tokens=12000,
-            timeout=180,
-        )
+        response = None
+        if openai_client and openai_key:
+            try:
+                response = await openai_client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    max_completion_tokens=12000,
+                    timeout=180,
+                )
+            except Exception as oe:
+                print(f"[Hinglish] OpenAI validation failed: {oe}. Trying DeepSeek fallback...")
+
+        if not response:
+            if not deepseek_client:
+                raise Exception("Neither OpenAI nor DeepSeek client is configured/working.")
+            response = await deepseek_client.chat.completions.create(
+                model="deepseek-v4-pro",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_object"},
+                max_completion_tokens=12000,
+                timeout=180,
+            )
         payload = json.loads(response.choices[0].message.content or "{}")
         for item in payload.get("entries", []):
             if (

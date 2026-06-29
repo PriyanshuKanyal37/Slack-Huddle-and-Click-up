@@ -5,7 +5,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai_key = os.getenv("OPENAI_API_KEY")
+client = AsyncOpenAI(api_key=openai_key) if openai_key else None
+
+deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+deepseek_client = AsyncOpenAI(
+    api_key=deepseek_key,
+    base_url="https://api.deepseek.com"
+) if deepseek_key else None
 
 SYSTEM_PROMPT = """# WHO YOU ARE
 You are a senior business analyst embedded in an Indian startup called Ladder. Your job is to read the English transcript of an internal Slack Huddle meeting and produce complete, detailed, professional meeting notes for the team's ClickUp workspace.
@@ -192,13 +199,30 @@ async def extract_meeting_keywords(transcript: str) -> list[str]:
     )
 
     try:
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_completion_tokens=256,
-            timeout=30
-        )
+        resp = None
+        if client and openai_key:
+            try:
+                resp = await client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"},
+                    max_completion_tokens=256,
+                    timeout=30
+                )
+            except Exception as oe:
+                print(f"[Keywords] OpenAI extraction failed: {oe}. Trying DeepSeek fallback...")
+
+        if not resp:
+            if not deepseek_client:
+                raise Exception("Neither OpenAI nor DeepSeek client is configured/working.")
+            resp = await deepseek_client.chat.completions.create(
+                model="deepseek-v4-flash",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                max_completion_tokens=256,
+                timeout=30
+            )
+
         raw = json.loads(resp.choices[0].message.content)
         keywords = raw.get("keywords") or next(iter(raw.values()), [])
         keywords = [k for k in keywords if isinstance(k, str) and k.strip()]
@@ -240,16 +264,35 @@ async def structure_notes(
         f"TRANSCRIPT:\n{transcript}"
     )
 
-    response = await client.chat.completions.create(
-        model="gpt-5.1",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message}
-        ],
-        response_format={"type": "json_object"},
-        max_completion_tokens=8192,
-        timeout=180
-    )
+    response = None
+    if client and openai_key:
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-5.1",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message}
+                ],
+                response_format={"type": "json_object"},
+                max_completion_tokens=8192,
+                timeout=180
+            )
+        except Exception as oe:
+            print(f"[Summarizer] OpenAI structure_notes failed: {oe}. Trying DeepSeek fallback...")
+
+    if not response:
+        if not deepseek_client:
+            raise Exception("Neither OpenAI nor DeepSeek client is configured/working.")
+        response = await deepseek_client.chat.completions.create(
+            model="deepseek-v4-pro",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_message}
+            ],
+            response_format={"type": "json_object"},
+            max_completion_tokens=8192,
+            timeout=180
+        )
 
     try:
         notes = json.loads(response.choices[0].message.content)
