@@ -596,10 +596,10 @@ async def slack_webhook(request: Request, background_tasks: BackgroundTasks):
             print(f"[AutoJoin] Huddle started in {channel_id}. Sending Recall bot...")
             background_tasks.add_task(send_recall_bot_to_huddle, huddle_url, channel_id)
 
-        # Clear from active set when huddle ends (no more attendees) and trigger instant leave_call
-        elif attendee_count == 0 and channel_id in active_huddles:
+        # Clear from active set when all human attendees leave (attendee_count <= 1) and trigger instant leave_call
+        elif attendee_count <= 1 and channel_id in active_huddles:
             active_huddles.discard(channel_id)
-            print(f"[AutoJoin] Huddle ended in {channel_id}. Channel cleared.")
+            print(f"[AutoJoin] Huddle ended (attendee_count={attendee_count}) in {channel_id}. Channel cleared.")
             try:
                 bot_id_raw = await redis.get(f"active_huddle_bot:{channel_id}")
                 if bot_id_raw:
