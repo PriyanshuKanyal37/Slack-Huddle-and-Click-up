@@ -257,10 +257,26 @@ async def send_recall_bot_to_huddle(huddle_url: str, channel_id: str):
         response.raise_for_status()
         bot_id = response.json().get("id")
         print(f"[AutoJoin] Recall bot sent to huddle in channel {channel_id}. Bot ID: {bot_id}")
+        if bot_id:
+            try:
+                await redis.set(f"active_huddle_bot:{channel_id}", bot_id, ex=24 * 3600)
+            except Exception as e:
+                print(f"[AutoJoin] Failed to store active_huddle_bot key: {e}")
     except Exception as e:
         # Remove from active set so next huddle in this channel can retry
         active_huddles.discard(channel_id)
         print(f"[AutoJoin] Failed to send bot to {huddle_url}: {e}")
+
+
+async def _send_recall_leave_call(bot_id: str):
+    """Sends leave_call instruction to Recall.ai for a given bot_id."""
+    headers = {"Authorization": f"Token {RECALL_API_KEY}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(f"{RECALL_BASE_URL}/bot/{bot_id}/leave_call/", headers=headers)
+            print(f"[AutoLeave] Leave call sent for bot {bot_id}: status {resp.status_code}")
+    except Exception as e:
+        print(f"[AutoLeave] Failed to send leave_call for bot {bot_id}: {e}")
 
 
 # ── RECALL.AI API ─────────────────────────────────────────────────────────────
@@ -580,10 +596,19 @@ async def slack_webhook(request: Request, background_tasks: BackgroundTasks):
             print(f"[AutoJoin] Huddle started in {channel_id}. Sending Recall bot...")
             background_tasks.add_task(send_recall_bot_to_huddle, huddle_url, channel_id)
 
-        # Clear from active set when huddle ends (no more attendees)
+        # Clear from active set when huddle ends (no more attendees) and trigger instant leave_call
         elif attendee_count == 0 and channel_id in active_huddles:
             active_huddles.discard(channel_id)
             print(f"[AutoJoin] Huddle ended in {channel_id}. Channel cleared.")
+            try:
+                bot_id_raw = await redis.get(f"active_huddle_bot:{channel_id}")
+                if bot_id_raw:
+                    bot_id = bot_id_raw.decode() if isinstance(bot_id_raw, bytes) else str(bot_id_raw)
+                    print(f"[AutoLeave] Huddle ended in {channel_id}. Triggering leave_call for bot {bot_id}...")
+                    background_tasks.add_task(_send_recall_leave_call, bot_id)
+                    await redis.delete(f"active_huddle_bot:{channel_id}")
+            except Exception as e:
+                print(f"[AutoLeave] Error retrieving active_huddle_bot from Redis: {e}")
 
     # App Home opened — show enable button (or confirmation if already authorized)
     if event_type == "app_home_opened":
