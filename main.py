@@ -116,6 +116,15 @@ async def poll_once():
         return
 
     all_bots = response.json().get("results", [])
+
+    # Safety net for the /webhook/recall evictor: this service can be asleep when
+    # that webhook fires, and Recall's own auto-leave has been seen to hang after
+    # recording_done. A bot left in the call keeps the Slack huddle "live" forever.
+    for b in all_bots:
+        if _bot_should_leave([c.get("code") for c in b.get("status_changes") or []]):
+            print(f"[AutoLeave] Poller found bot {b['id']} still in call after recording. Leaving...")
+            await _send_recall_leave_call(b["id"])
+
     cutoff   = datetime.now(timezone.utc) - timedelta(hours=24)
 
     fresh_bots = []
@@ -269,18 +278,54 @@ async def send_recall_bot_to_huddle(huddle_url: str, channel_id: str):
 
 
 async def _send_recall_leave_call(bot_id: str):
-    """Sends stop_recording and leave_call instructions to Recall.ai for a given bot_id."""
+    """
+    Tell a Recall bot to leave the call. leave_call finalizes the recording AND
+    disconnects, so it is the only command needed.
+
+    Do NOT call stop_recording first: it shuts the bot down, and the follow-up
+    leave_call then races the shutdown and loses with
+    400 bot_command_error "the bot completed recording and has shut down".
+    A bot that shuts down without leaving stays in the Slack huddle forever.
+    """
     headers = {"Authorization": f"Token {RECALL_API_KEY}", "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            # 1. Stop recording (frees the recording lock immediately)
-            stop_resp = await client.post(f"{RECALL_BASE_URL}/bot/{bot_id}/stop_recording/", headers=headers, json={})
-            print(f"[AutoLeave] Stop recording sent for bot {bot_id}: status {stop_resp.status_code}")
-            # 2. Leave call
             leave_resp = await client.post(f"{RECALL_BASE_URL}/bot/{bot_id}/leave_call/", headers=headers, json={})
-            print(f"[AutoLeave] Leave call sent for bot {bot_id}: status {leave_resp.status_code}")
+            print(f"[AutoLeave] Leave call sent for bot {bot_id}: status {leave_resp.status_code} {leave_resp.text[:200]}")
     except Exception as e:
         print(f"[AutoLeave] Error in _send_recall_leave_call for bot {bot_id}: {e}")
+
+
+def _bot_should_leave(codes: list) -> bool:
+    """
+    True when a bot is still in the call but its recording has ended.
+
+    Recall emits 'in_call_not_recording' twice: once on join (nothing recorded
+    yet) and once when the meeting ends. Only the second warrants leave_call —
+    and it is the LAST usable window, because the next state, 'recording_done',
+    means the bot has already shut down and Recall rejects every command.
+
+    Never fires while codes[-1] == 'in_call_recording', so a live meeting is
+    never cut short.
+
+    ponytail: a human manually pausing recording mid-huddle would also match and
+    evict the bot early. Not reachable today (nothing in this app calls
+    stop_recording); if that changes, gate on a Recall 'call ended' signal too.
+    """
+    return bool(codes) and codes[-1] == "in_call_not_recording" and "in_call_recording" in codes
+
+
+async def _leave_call_if_recording_finished(bot_id: str):
+    """Evict a bot whose meeting is over, while it is still commandable."""
+    try:
+        details = await get_bot_details(bot_id)
+    except Exception as e:
+        print(f"[AutoLeave] Could not fetch bot {bot_id}: {e}")
+        return
+    codes = [c.get("code") for c in details.get("status_changes") or []]
+    if _bot_should_leave(codes):
+        print(f"[AutoLeave] Bot {bot_id} finished recording but is still in the call. Leaving...")
+        await _send_recall_leave_call(bot_id)
 
 
 # ── RECALL.AI API ─────────────────────────────────────────────────────────────
@@ -536,6 +581,18 @@ async def recall_webhook(request: Request, background_tasks: BackgroundTasks):
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON") from None
     event = payload.get("event", "")
+
+    # Recording just stopped → the meeting is over but the bot is still in the call.
+    # This is the only moment leave_call still works; after 'recording_done' the bot
+    # has shut down and a bot left in the call keeps the Slack huddle "live" forever.
+    if event == "bot.in_call_not_recording" or (
+        event == "bot.status_change"
+        and (payload.get("data", {}).get("status") or {}).get("code") == "in_call_not_recording"
+    ):
+        data = payload.get("data") or {}
+        leaving_id = (data.get("bot") or {}).get("id") or data.get("bot_id") or ""
+        if leaving_id:
+            background_tasks.add_task(_leave_call_if_recording_finished, leaving_id)
 
     # Only process when bot recording is fully done
     bot_id = _recall_done_bot_id(payload)
