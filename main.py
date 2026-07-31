@@ -269,14 +269,18 @@ async def send_recall_bot_to_huddle(huddle_url: str, channel_id: str):
 
 
 async def _send_recall_leave_call(bot_id: str):
-    """Sends leave_call instruction to Recall.ai for a given bot_id."""
+    """Sends stop_recording and leave_call instructions to Recall.ai for a given bot_id."""
     headers = {"Authorization": f"Token {RECALL_API_KEY}", "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(f"{RECALL_BASE_URL}/bot/{bot_id}/leave_call/", headers=headers)
-            print(f"[AutoLeave] Leave call sent for bot {bot_id}: status {resp.status_code}")
+            # 1. Stop recording (frees the recording lock immediately)
+            stop_resp = await client.post(f"{RECALL_BASE_URL}/bot/{bot_id}/stop_recording/", headers=headers, json={})
+            print(f"[AutoLeave] Stop recording sent for bot {bot_id}: status {stop_resp.status_code}")
+            # 2. Leave call
+            leave_resp = await client.post(f"{RECALL_BASE_URL}/bot/{bot_id}/leave_call/", headers=headers, json={})
+            print(f"[AutoLeave] Leave call sent for bot {bot_id}: status {leave_resp.status_code}")
     except Exception as e:
-        print(f"[AutoLeave] Failed to send leave_call for bot {bot_id}: {e}")
+        print(f"[AutoLeave] Error in _send_recall_leave_call for bot {bot_id}: {e}")
 
 
 # ── RECALL.AI API ─────────────────────────────────────────────────────────────
