@@ -38,6 +38,12 @@ from services.clickup_brain import (
     send_clickup_brain_channel_post,
 )
 from services.hinglish_transcript import build_validated_hinglish_transcript
+from services.gemini_transcriber import (
+    GEMINI_API_KEY,
+    GeminiQuotaExhausted,
+    gemini_available,
+    transcribe_with_gemini,
+)
 
 load_dotenv()
 
@@ -70,6 +76,7 @@ redis = Redis(
 app = FastAPI()
 
 POLL_INTERVAL_SECONDS   = 1800   # poll every 30 minutes as backup (webhook is primary trigger)
+POLL_LOOKBACK_HOURS     = 72     # > 24h so a meeting deferred for Gemini's daily quota reset isn't dropped as stale
 in_progress: set        = set()  # bots currently being processed
 failed_bots: dict       = {}     # bot_id → failure count; skip after 3 failures
 active_huddles: set     = set()  # channel IDs where a Recall bot was already sent
@@ -98,7 +105,7 @@ async def poll_once():
         "Authorization": f"Token {RECALL_API_KEY}",
         "Content-Type": "application/json"
     }
-    since = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+    since = (datetime.now(timezone.utc) - timedelta(hours=POLL_LOOKBACK_HOURS)).isoformat()
     for attempt in range(1, RECALL_MAX_RETRIES + 1):
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
@@ -125,11 +132,11 @@ async def poll_once():
             print(f"[AutoLeave] Poller found bot {b['id']} still in call after recording. Leaving...")
             await _send_recall_leave_call(b["id"])
 
-    cutoff   = datetime.now(timezone.utc) - timedelta(hours=24)
+    cutoff   = datetime.now(timezone.utc) - timedelta(hours=POLL_LOOKBACK_HOURS)
 
     fresh_bots = []
     for b in all_bots:
-        # Skip bots whose meeting started more than 24 hours ago — stale, never process
+        # Skip bots whose meeting started more than POLL_LOOKBACK_HOURS ago — stale, never process
         join_at_str = b.get("join_at") or b.get("created_at", "")
         try:
             join_at = datetime.fromisoformat(join_at_str.replace("Z", "+00:00"))
@@ -355,10 +362,33 @@ async def get_bot_details(bot_id: str) -> dict:
 
 # ── PIPELINE ─────────────────────────────────────────────────────────────────
 
+async def _keep_awake():
+    """
+    Render's free plan sleeps after 15 min without inbound HTTP traffic, killing a long pipeline
+    (a 1-hour meeting takes ~15 min to transcribe). Ping our own public URL while one runs.
+    """
+    url = os.getenv("RENDER_EXTERNAL_URL")  # set automatically by Render; absent locally
+    if not url:
+        return
+    while True:
+        await asyncio.sleep(240)
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                await client.get(url)
+        except Exception:
+            pass
+
+
 async def run_pipeline(bot_id: str):
     # Prevent duplicate processing (webhook + poller running at same time)
     if await is_processed(bot_id) or bot_id in in_progress or failed_bots.get(bot_id, 0) >= 3:
         print(f"[Pipeline] Bot {bot_id} already processed/in-progress/failed. Skipping.")
+        return
+
+    # Every Gemini model's daily quota used up: wait for the reset instead of downloading media
+    # just to fail and burn one of the 3 allowed failures. The poller retries every 30 min.
+    if GEMINI_API_KEY and not await gemini_available():
+        print(f"[Pipeline] Gemini daily quota used up on all models — bot {bot_id} deferred until the reset.")
         return
 
     lock_acquired = await acquire_pipeline_lock(bot_id)
@@ -369,6 +399,8 @@ async def run_pipeline(bot_id: str):
     in_progress.add(bot_id)
     print(f"\n[Pipeline] Processing bot: {bot_id}")
     tmp_media_path = ""
+    deferred = False  # True when Gemini ran out of daily quota mid-run: retry later, don't count as a failure
+    keepalive = asyncio.create_task(_keep_awake())
 
     try:
         # Fetch full bot details from Recall.ai
@@ -467,9 +499,22 @@ async def run_pipeline(bot_id: str):
                         downloaded += len(chunk)
         print(f"[Step 1] Downloaded {downloaded / 1024 / 1024:.1f} MB")
 
-        # Step 2 — Transcribe with Sarvam AI (Hindi → English)
-        print("[Step 2] Transcribing with Sarvam AI...")
-        transcript_result = await transcribe_audio_detailed(tmp_media_path)
+        # Step 2 — Transcribe: Gemini free tier (English + Roman Hinglish, speakers named), Sarvam AI as fallback
+        transcript_result = hinglish_result = None
+        if GEMINI_API_KEY:
+            print("[Step 2] Transcribing with Gemini...")
+            try:
+                transcript_result, hinglish_result = await transcribe_with_gemini(
+                    tmp_media_path, bot_id, participants, speaker_timeline
+                )
+            except GeminiQuotaExhausted as e:
+                deferred = True
+                print(f"[Step 2] {e}. Trying Sarvam AI; otherwise retried after the reset (finished parts are cached).")
+            except Exception as e:
+                print(f"[Step 2] Gemini failed: {e} — falling back to Sarvam AI")
+        if transcript_result is None:
+            print("[Step 2] Transcribing with Sarvam AI...")
+            transcript_result = await transcribe_audio_detailed(tmp_media_path)
         transcript = transcript_result.text
         print(f"[Step 2] Transcript: {transcript[:200]}...")
 
@@ -510,14 +555,19 @@ async def run_pipeline(bot_id: str):
         # Step 7 — Send full speaker transcript to ClickUp Brain Slack channel
         print("[Step 7] Sending ClickUp Brain channel transcript...")
         try:
-            named_transcript = assign_participant_names(
+            # Gemini already named each speaker (voice + Recall speaker log); only Sarvam output needs mapping.
+            named_transcript = transcript_result if hinglish_result is not None else assign_participant_names(
                 transcript_result,
                 speaker_timeline,
                 duration_seconds=metadata.get("duration_seconds") or None,
             )
             transcript_text = format_speaker_transcript(named_transcript, metadata, notes)
             hinglish_transcript_text = None
-            if ENABLE_HINGLISH_TRANSCRIPT and tmp_media_path and os.path.exists(tmp_media_path):
+            if hinglish_result is not None:  # same Gemini call already produced it — no second audio pass
+                hinglish_transcript_text = format_speaker_transcript(
+                    hinglish_result, metadata, notes, heading="Roman-Hinglish Speaker Transcript"
+                )
+            elif ENABLE_HINGLISH_TRANSCRIPT and tmp_media_path and os.path.exists(tmp_media_path):
                 try:
                     print("[Step 7] Generating validated Roman-Hinglish transcript...")
                     hinglish_transcript = await build_validated_hinglish_transcript(
@@ -548,12 +598,16 @@ async def run_pipeline(bot_id: str):
         print(f"[Pipeline] Done. Bot {bot_id} marked as processed.")
 
     except Exception as e:
-        count = failed_bots.get(bot_id, 0) + 1
-        failed_bots[bot_id] = count
-        print(f"[Pipeline] ERROR for bot {bot_id} (attempt {count}/3): {e}")
-        if count >= 3:
-            print(f"[Pipeline] Bot {bot_id} failed 3 times — skipping permanently.")
+        if deferred:
+            print(f"[Pipeline] Bot {bot_id} deferred until Gemini's daily quota resets: {e}")
+        else:
+            count = failed_bots.get(bot_id, 0) + 1
+            failed_bots[bot_id] = count
+            print(f"[Pipeline] ERROR for bot {bot_id} (attempt {count}/3): {e}")
+            if count >= 3:
+                print(f"[Pipeline] Bot {bot_id} failed 3 times — skipping permanently.")
     finally:
+        keepalive.cancel()
         if tmp_media_path and os.path.exists(tmp_media_path):
             os.unlink(tmp_media_path)
         in_progress.discard(bot_id)

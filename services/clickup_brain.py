@@ -246,7 +246,7 @@ def format_speaker_transcript(
         f"Started: {_format_started_at(metadata.get('started_at', ''))}",
         f"Duration: {metadata.get('duration_minutes', 0)} min",
         f"Participants: {_participant_list(metadata)}",
-        f"Transcript source: Sarvam AI {transcript.source}",
+        f"Transcript source: {transcript.source if transcript.source.startswith('Gemini') else 'Sarvam AI ' + transcript.source}",
         "",
         heading,
         "=" * len(heading),
